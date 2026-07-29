@@ -116,6 +116,14 @@ class SceneRenderer:
         self._bars: dict[int, tuple[NodePath, NodePath]] = {}
         # Shield bubbles, one per station that has bought any.
         self._shields: dict[int, NodePath] = {}
+        # The crate inside each cargo bubble, kept so it can be spun. A child of the
+        # pickup node, so it dies with it.
+        self._pickup_boxes: dict[int, NodePath] = {}
+        # Seconds since the renderer started, for anything that idles or tumbles.
+        self._spin = 0.0
+        # Last-seen tier per entity. Impact sparks colour an asteroid by its tier, and an
+        # event asks after the body may already have left the snapshot.
+        self._tiers: dict[int, int] = {}
         # Stations hidden because they were breached, and which must come back when the
         # server rebuilds them for the next round.
         self._breached: set[int] = set()
@@ -308,17 +316,22 @@ class SceneRenderer:
         for bubble in self._shields.values():
             bubble.removeNode()
         self._shields = {}
+        self._pickup_boxes = {}
         self._breached = set()
         self.effects.clear()
         self.beam.hide()
         self._cam_pos = None
 
     def sync(self, bodies, own_ship: int) -> None:
+        # Advanced from the frame clock rather than a passed-in dt, so nothing that only
+        # tumbles for decoration has to be threaded through every caller.
+        self._spin += globalClock.getDt()
         seen = set()
 
         for b in bodies:
             seen.add(b.entity)
             self.meta[b.entity] = (b.kind, b.team, b.radius)
+            self._tiers[b.entity] = b.tier
             node = self.nodes.get(b.entity)
             if node is None:
                 node = self._create_node(b, own_ship)
@@ -330,6 +343,14 @@ class SceneRenderer:
             if b.kind == proto.KIND_BOLT:
                 # Pose is all a bolt needs per frame; its stretch is set once at creation.
                 pass
+            elif b.kind == proto.KIND_PICKUP:
+                # The bubble is the collection radius, so it is drawn at exactly that.
+                node.setScale(max(1.0, b.radius))
+                box = self._pickup_boxes.get(b.entity)
+                if box is not None:
+                    # A slow tumble. Static boxes in a static field read as scenery; a
+                    # turning one reads as something to go and get.
+                    box.setHpr(self._spin * 40.0, self._spin * 26.0, 0)
             elif b.kind == proto.KIND_HAZARD:
                 # Team colour while held, neutral white while empty or contested. The
                 # server sends 0xFF for both, which is right: neither pays anyone.
@@ -367,6 +388,9 @@ class SceneRenderer:
             bubble = self._shields.pop(entity, None)
             if bubble is not None:
                 bubble.removeNode()
+            # The box is a child of the pickup node that has just gone, so it needs no
+            # removeNode of its own — only the reference dropping.
+            self._pickup_boxes.pop(entity, None)
 
     def _sync_boost_flame(self, node: NodePath, b) -> None:
         """Show or hide a ship's boost plume, and make it flicker while lit.
@@ -395,6 +419,47 @@ class SceneRenderer:
     # over everything at all times would turn a quiet belt into a wall of UI, and the
     # question a bar answers — "is this nearly dead?" — does not exist until someone has
     # started shooting.
+
+    def _make_pickup(self, b) -> NodePath:
+        """A cargo box inside a bubble.
+
+        The bubble is what you aim at — it is the collection radius made visible, so
+        flying "through it" means what it looks like it means. The box is small and solid
+        in the middle so the thing has a centre to read at distance.
+
+        Every box is the same green whatever is inside it. What you get is a surprise
+        until you have it, which makes the decision to go for one a decision about
+        position rather than about shopping; the item's own colour appears on the hotbar
+        slot, once it is yours.
+        """
+        rgb = proto.PICKUP_COLOR
+
+        root = self.world.attachNewNode(f"pickup-{b.entity}")
+
+        bubble = self._sphere.copyTo(root)
+        bubble.setTransparency(TransparencyAttrib.MAlpha)
+        bubble.setLightOff()
+        bubble.setDepthWrite(False)
+        bubble.setBin("transparent", 14)
+        bubble.setAttrib(ColorBlendAttrib.make(
+            ColorBlendAttrib.MAdd,
+            ColorBlendAttrib.OIncomingAlpha,
+            ColorBlendAttrib.OOne,
+        ))
+        # Wireframe for the same reason the hill is: a solid sphere this size is a wall
+        # you cannot see the far side of, and the whole point is to fly into it.
+        bubble.setRenderModeWireframe()
+        bubble.setRenderModeThickness(1.3)
+        bubble.setTwoSided(True)
+        bubble.setColor(rgb[0], rgb[1], rgb[2], 0.40)
+
+        box = self._sphere.copyTo(root)
+        box.setLightOff()
+        box.setColor(rgb[0], rgb[1], rgb[2], 1.0)
+        # Squashed into a crate rather than left a ball, so it is not mistaken for a rock.
+        box.setScale(0.20, 0.20, 0.20)
+        self._pickup_boxes[b.entity] = box
+        return root
 
     def _make_health_bar(self) -> tuple[NodePath, NodePath]:
         """A billboarded track with a left-anchored fill, in world space."""
@@ -626,6 +691,38 @@ class SceneRenderer:
         self.effects.add_explosion(node.getPos(), max(1.5, radius * scale), rgb,
                                    shards=shards)
 
+    def impact(self, entity: int, damage: float = 0.0, rgb=None,
+               shooter_pos=None) -> None:
+        """A hit: a spark on the surface that was struck.
+
+        Placed on the *near face* rather than at the body's centre when the shot's origin
+        is known — a flash inside a 40 m asteroid is a faint glow somewhere in the middle
+        of it, which reads as nothing at all. Offsetting to the surface is what makes a
+        hit look like it landed on something.
+
+        Sized by damage so a grazing laser and a missile do not look identical, and
+        clamped so a big number cannot fill the screen.
+        """
+        node = self.nodes.get(entity)
+        if node is None:
+            return
+        _kind, team, radius = self.meta.get(entity, (0, proto.NO_TEAM, 2.0))
+
+        pos = node.getPos()
+        if shooter_pos is not None:
+            to = pos - shooter_pos
+            if to.length() > 1e-3:
+                pos = pos - to.normalized() * radius
+
+        if rgb is None:
+            rgb = proto.team_color(team) if team != proto.NO_TEAM else (1.0, 0.85, 0.45)
+
+        size = max(1.2, min(6.0, 1.2 + damage * 0.22))
+        self.effects.add_flash(pos, size, rgb)
+        # A few sparks as well as the flash. One primitive on its own reads as a light
+        # switching on; debris reads as something being hit.
+        self.effects.add_debris(pos, size * 0.9, rgb, count=4, speed=18.0)
+
     def set_beam_team(self, team: int) -> None:
         """Colour the tractor beam for a crew.
 
@@ -652,6 +749,20 @@ class SceneRenderer:
         """
         _kind, team, _radius = self.meta.get(entity, (0, proto.NO_TEAM, 0.0))
         return team
+
+    def set_dust_enabled(self, on: bool) -> None:
+        """Show or hide the near-field dust.
+
+        A few hundred motes is the cheapest thing in the scene, but it is also the only
+        part of it that is pure decoration — so it is the one graphics option that can be
+        turned off without changing what you can see of the game.
+        """
+        self._dust.show() if on else self._dust.hide()
+
+    def tier_of(self, entity: int) -> int:
+        """A body's tier from the last snapshot that carried it. Asteroid colours read
+        off this, and an event asks after the body may already be gone."""
+        return self._tiers.get(entity, 0)
 
     def entity_pos(self, entity: int):
         node = self.nodes.get(entity)
@@ -781,10 +892,12 @@ class SceneRenderer:
             self._paint_mothership(node, b.team)
             return node
 
+        if b.kind == proto.KIND_PICKUP:
+            return self._make_pickup(b)
+
         if b.kind == proto.KIND_BOLT:
             # A stretched, unlit sliver in the shooter's colours. Long on +Y because the
-            # server hands us a rotation that already points down the flight path, so the
-            # bolt leans into its own arc as it falls without the client knowing the arc.
+            # server hands us a rotation that already points down the flight path.
             node = self._sphere.copyTo(self.world)
             node.setLightOff()
             node.setTransparency(TransparencyAttrib.MAlpha)
@@ -799,7 +912,15 @@ class SceneRenderer:
             # Lifted hard toward white: a bolt is a spark, and the darker team colours
             # read as a thrown pebble at full saturation.
             node.setColor(r * 0.35 + 0.65, g * 0.35 + 0.65, bl * 0.35 + 0.65, 0.95)
-            node.setScale(BOLT_GIRTH, BOLT_LENGTH, BOLT_GIRTH)
+
+            if b.tier == proto.BOLT_MISSILE:
+                # A missile is the same primitive at a very different size, and warmer, so
+                # "that is not a laser" is readable in the fraction of a second there is
+                # to decide whether to get out of the way.
+                node.setColor(1.0, 0.72, 0.35, 1.0)
+                node.setScale(BOLT_GIRTH * 3.2, BOLT_LENGTH * 1.6, BOLT_GIRTH * 3.2)
+            else:
+                node.setScale(BOLT_GIRTH, BOLT_LENGTH, BOLT_GIRTH)
             return node
 
         if b.kind == proto.KIND_HAZARD:

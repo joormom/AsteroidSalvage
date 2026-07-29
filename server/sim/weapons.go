@@ -73,9 +73,17 @@ func (p *Player) EnergyRegenPerSecond() float32 {
 	return p.MaxEnergy() / float32(secs)
 }
 
-// LaserDamageDealt is this player's per-shot damage, including upgrades.
+// LaserDamageDealt is this player's per-shot damage, including upgrades and any active
+// damage boost.
+//
+// Read at the moment a round is fired and carried on the bolt, so a boost that expires
+// mid-flight does not retroactively weaken a shot already in the air.
 func (p *Player) LaserDamageDealt() float32 {
-	return LaserDamage * (1.0 + 0.4*float32(p.Upgrades[UpgradeLaser]))
+	dmg := LaserDamage * (1.0 + 0.4*float32(p.Upgrades[UpgradeLaser]))
+	if p.Effects.Damage > 0 {
+		dmg *= BoostScale
+	}
+	return dmg
 }
 
 // Shots returns the laser discharges from the most recent tick.
@@ -174,6 +182,13 @@ func (s *Sim) destroyShip(victim, killer *Player) {
 		s.release(victim, EventDropped)
 	}
 
+	victim.Stats.Deaths++
+	// A ram destroys both ships and calls this twice, once each way, so both pilots are
+	// credited a kill and charged a death. That is the trade ramming actually is.
+	if killer != nil && killer != victim {
+		killer.Stats.Kills++
+	}
+
 	s.startRespawn(victim)
 	if o, ok := s.objects[victim.Ship]; ok {
 		o.Health = 0
@@ -203,6 +218,12 @@ func (s *Sim) destroyShip(victim, killer *Player) {
 // Every death funnels through here rather than assigning respawnIn directly, so a new way
 // to die cannot quietly become a free one.
 func (s *Sim) startRespawn(victim *Player) {
+	// Dying spends whatever was being carried, along with any boost still running. An
+	// item is a window; one that survives a death is a permanent upgrade with extra
+	// steps, and a shield you could bank across a respawn would never be used at a
+	// moment of risk.
+	victim.ClearItems()
+
 	if s.spendLife(victim.Team) {
 		victim.respawnIn = RespawnTicks
 		return

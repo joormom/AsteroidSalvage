@@ -155,6 +155,8 @@ func (s *Sim) collectRock(p *Player, o *Object) {
 	value := o.Value * o.Integrity * bonus
 
 	p.Credits += value
+	p.Stats.Delivered++
+	p.Stats.Banked += value
 	if t, ok := s.teams[p.Team]; ok {
 		t.Score += value
 	}

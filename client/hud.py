@@ -51,9 +51,23 @@ BOOST_CHARGING = (0.72, 0.56, 0.16, 1.0)
 BOOST_REENGAGE_SECONDS = 1.0
 
 # Bar rows, bottom-centre and stacked upward above the help line.
-BAR_Y_HULL = 0.245
-BAR_Y_ENERGY = 0.190
-BAR_Y_BOOST = 0.135
+# Raised to clear the item hotbar, which now owns the bottom centre. The help line that
+# used to sit under these is gone (it lives in the settings screen), so the stack moved up
+# rather than the bars getting thinner.
+BAR_Y_HULL = 0.375
+BAR_Y_ENERGY = 0.320
+BAR_Y_BOOST = 0.265
+
+# The item shield, above the hull — it is the layer damage reaches first, so it is drawn
+# where damage arrives from. Shown only while one is up: a permanently visible empty bar
+# would be a fourth thing to ignore, and the whole point is that it is exceptional.
+BAR_Y_SHIELD = 0.430
+SHIELD_FULL = (0.55, 1.00, 0.65, 1.0)
+SHIELD_LOW = (0.95, 1.00, 0.45, 1.0)
+
+# Must match sim.ShieldPool. Only affects the "n / 30" label; the bar itself is driven by
+# the fraction the server reports.
+SHIELD_POOL = 30.0
 
 
 def _bolt_icon(color=BOOST_FULL) -> NodePath:
@@ -122,21 +136,16 @@ class HUD:
             shadow=(0, 0, 0, 0.75),
         )
 
-        self.help = OnscreenText(
-            text="",
-            pos=(0, 0.06),
-            scale=0.036,
-            fg=(0.75, 0.78, 0.85, 1.0),
-            align=TextNode.ACenter,
-            mayChange=True,
-            parent=base.a2dBottomCenter,
-            shadow=(0, 0, 0, 0.75),
-        )
+        # There is no control-hint line here any more. It was reference material printed
+        # under the crosshair for the whole match; it now lives in the settings screen,
+        # which is where you go when you want to look something up. See
+        # keybinds.ACTIONS.
 
         # --- status bars ---
         #
         # Bottom centre, stacked above the help line, so a glance down covers "can I take
         # another hit", "can I shoot" and "can I run" without leaving the flight picture.
+        self._shield_track, self._shield_fill = self._bar(base, BAR_Y_SHIELD)
         self._hull_track, self._hull_fill = self._bar(base, BAR_Y_HULL)
         self._energy_track, self._energy_fill = self._bar(base, BAR_Y_ENERGY)
         self._boost_track, self._boost_fill = self._bar(base, BAR_Y_BOOST)
@@ -153,6 +162,7 @@ class HUD:
                 shadow=(0, 0, 0, 0.75),
             )
 
+        self.shield_label = bar_label(BAR_Y_SHIELD, SHIELD_FULL)
         self.energy_label = bar_label(BAR_Y_ENERGY, (0.80, 0.85, 0.95, 1.0))
         # Hull in absolute numbers, not just a bar: "3 / 30" tells you how many more hits
         # you have in a way that a green sliver does not.
@@ -165,6 +175,14 @@ class HUD:
         self._boost_icon.reparentTo(base.a2dBottomCenter)
         self._boost_icon.setPos(-(BAR_WIDTH / 2 + 0.045), 0, BAR_Y_BOOST)
         self._boost_icon.setScale(0.032)
+
+        # Start hidden. The bars are shown by _set_bars once there is a PlayerState to
+        # drive them, and leaving a game hides them again — but between launching and
+        # joining anything, nothing had ever hidden them, so three empty tracks and a
+        # lightning bolt sat over the menus. The same reasoning as the help line: the
+        # front end is not the place for flight instruments.
+        for np in self._bar_nodes():
+            np.hide()
 
         # Respawn countdown: big and central, because being dead is the one state where
         # the player has nothing else to read.
@@ -201,14 +219,61 @@ class HUD:
         )
         return track, fill
 
-    def set_help(self, text: str) -> None:
-        self.help.setText(text)
+    def _all_nodes(self):
+        return (self.status, self.cargo, self.distance, self.scores, self.match,
+                self.toast, self.respawn, self.energy_label, self.hull_label,
+                self.boost_label, self.shield_label) + self._bar_nodes()
+
+    def set_visible(self, visible: bool) -> None:
+        """Show or hide the whole HUD.
+
+        Full-screen overlays need this. The HUD hangs off a2dTopLeft, a2dBottomCenter and
+        friends rather than off one root, and those are drawn after an overlay's frame —
+        so without this the clock, the scores and the status bars sit on top of the
+        end-of-match table instead of behind it.
+        """
+        for np in self._all_nodes():
+            np.show() if visible else np.hide()
+
+        if visible:
+            # The bars are driven by _set_bars and must not reappear just because the
+            # overlay closed: there may be no PlayerState behind them.
+            for np in self._bar_nodes():
+                np.hide()
 
     def _bar_nodes(self):
         return (self._hull_track, self._hull_fill,
                 self._energy_track, self._energy_fill,
                 self._boost_track, self._boost_fill,
-                self._boost_icon)
+                self._boost_icon,
+                self._shield_track, self._shield_fill)
+
+    def _shield_nodes(self):
+        return (self._shield_track, self._shield_fill)
+
+    def _set_shield(self, player) -> None:
+        """The item shield, drawn only while one is up.
+
+        Shields do not stack: using another replaces whatever was left, so this is always
+        one pool of 30 rather than a total that could climb. The label is absolute for the
+        same reason the hull's is — "12 / 30" says how many more hits it will eat, which a
+        shrinking green sliver does not.
+        """
+        pool = getattr(player, "item_shield", 0.0)
+        if pool <= 0:
+            for np in self._shield_nodes():
+                np.hide()
+            self.shield_label.setText("")
+            return
+
+        for np in self._shield_nodes():
+            np.show()
+        frac = max(0.0, min(1.0, pool / SHIELD_POOL))
+        self._shield_fill.setScale(max(0.001, frac), 1, 1)
+        low = frac <= 0.34
+        self._shield_fill["frameColor"] = SHIELD_LOW if low else SHIELD_FULL
+        self.shield_label.setText(f"{math.ceil(pool - 1e-6):.0f} / {int(SHIELD_POOL)}")
+        self.shield_label.setFg(Vec4(*(SHIELD_LOW if low else SHIELD_FULL)))
 
     def _set_bars(self, player, boosting: bool = False) -> None:
         """Drive the hull, charge and boost bars from the personal PlayerState."""
@@ -218,11 +283,14 @@ class HUD:
             self.energy_label.setText("")
             self.hull_label.setText("")
             self.boost_label.setText("")
+            self.shield_label.setText("")
             self.respawn.setText("")
             return
 
         for np in self._bar_nodes():
             np.show()
+        # Shown or hidden on its own terms, after the blanket show above.
+        self._set_shield(player)
 
         hull = max(0.0, min(1.0, player.health))
         self._hull_fill.setScale(max(0.001, hull), 1, 1)
@@ -293,7 +361,7 @@ class HUD:
         text do not linger behind the main menu."""
         for label in (self.status, self.cargo, self.distance, self.scores,
                       self.toast, self.match, self.energy_label, self.hull_label,
-                      self.boost_label, self.respawn):
+                      self.boost_label, self.shield_label, self.respawn):
             label.setText("")
         for np in self._bar_nodes():
             np.hide()
@@ -337,6 +405,13 @@ class HUD:
         elif event.type == proto.EVENT_ASTEROID_DESTROYED:
             tier = proto.TIER_NAMES.get(int(event.value), "rock")
             msg = f"shattered a {tier}"
+        elif event.type == proto.EVENT_ITEM_PICKED_UP:
+            item = proto.ITEM_INFO.get(int(event.value), ("something",))[0]
+            msg = f"picked up {item}"
+        elif event.type == proto.EVENT_ITEM_USED:
+            # No toast. The hotbar slot emptying and the effect line appearing already
+            # say it, and a toast for something you deliberately pressed is noise.
+            return
         elif event.type in (proto.EVENT_SHIP_HIT, proto.EVENT_ASTEROID_HIT,
                             proto.EVENT_MOTHERSHIP_HIT, proto.EVENT_SHIELD_ABSORBED):
             # Hits land several times a second; a toast per hit would strobe. The station
@@ -519,6 +594,16 @@ class HUD:
             else:
                 self.match.setText(f"MATCH LOST  -  team {match.winner} wins")
                 self.match.setFg(Vec4(1.0, 0.45, 0.40, 1.0))
+            return
+
+        if match.phase == proto.PHASE_LOBBY:
+            # A client can be in the world during a lobby — anything started with --url
+            # skips the menu entirely. Without this the round line read "ROUND 0 of 5
+            # 0:00", which describes a broken match rather than one that has not been
+            # started yet. There is no countdown to show: the lobby ends when the host
+            # ends it.
+            self.match.setText("WAITING FOR THE HOST TO START")
+            self.match.setFg(Vec4(0.85, 0.85, 0.5, 1.0))
             return
 
         if match.phase == proto.PHASE_WARMUP:

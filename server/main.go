@@ -55,6 +55,7 @@ func main() {
 		kothRate     = flag.Float64("koth-rate", 7, "king of the hill: points per second while holding")
 		kothShift    = flag.Int("koth-shift", 45, "king of the hill: seconds between hill moves (0 = fixed)")
 		kothCredits  = flag.Float64("koth-credits", 20, "king of the hill: credits per second to each holder")
+		lobby        = flag.Bool("lobby", false, "hold in a lobby until the host starts the match")
 		sandbox      = flag.Bool("sandbox", false, "one endless round, no clock or shop")
 		startCredits = flag.Float64("credits", 0, "credits every player starts with (testing)")
 		minEra       = flag.Int("era", 0, "floor the asteroid tier gate, so colossal (2) and titan (3) rocks spawn immediately (testing)")
@@ -78,6 +79,7 @@ func main() {
 		IntermissionSecs: *interSecs,
 		WarmupSeconds:    *warmupSecs,
 		DisableMatchFlow: *sandbox,
+		Lobby:            *lobby,
 		Lives:            *lives,
 		Mode:             parseMode(*mode),
 		Modes: sim.ModeConfig{

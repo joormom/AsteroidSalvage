@@ -276,6 +276,10 @@ func (s *Sim) destroyShipByStation(victim *Player, byTeam uint8) {
 		s.release(victim, EventDropped)
 	}
 
+	// A death with nobody to credit for the kill. It still costs the victim, and still
+	// spends one of the crew's lives.
+	victim.Stats.Deaths++
+
 	s.startRespawn(victim)
 	if o, ok := s.objects[victim.Ship]; ok {
 		o.Health = 0

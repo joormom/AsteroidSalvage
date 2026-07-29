@@ -80,18 +80,23 @@ class Shop:
             parent=self.root,
         )
 
-        for i in range(proto_offers_max()):
-            self.base.accept(str(i + 1), self._buy, [i])
-
+        # The number keys are NOT bound here. They are shared with the item hotbar, and
+        # accept() replaces a handler rather than adding to it — whichever of the two was
+        # constructed last would silently win. main.py owns them and dispatches on which
+        # of us is on screen.
         self.hide()
 
     # --- lifecycle ---------------------------------------------------------
 
-    def _buy(self, slot: int) -> None:
+    def buy(self, slot: int) -> None:
+        """Buy by slot. Called by a card click and by main.py's number-key dispatch."""
         # The server is the authority on whether the shop is open and affordable; the
         # client just asks.
         if self.visible:
             self.net.buy_offer(slot)
+
+    # Kept as the card button's command target.
+    _buy = buy
 
     def hide(self) -> None:
         self.visible = False

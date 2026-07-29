@@ -35,6 +35,32 @@ const (
 
 	// RamMothershipDamage is what one ship is worth when flown into an enemy station.
 	RamMothershipDamage = 15.0
+
+	// HullImpactThreshold is the closing speed above which flying into scenery starts
+	// hurting, in m/s. The same number cargo starts taking impact damage at, so a haul
+	// rough enough to damage the rock is rough enough to dent the ship carrying it —
+	// which is the intuition, and one threshold is easier to learn than two.
+	HullImpactThreshold = 12.0
+
+	// HullImpactScale is hull points per m/s over the threshold. One, deliberately: the
+	// rule is "every metre per second over twelve costs a hull point", which a player can
+	// actually hold in their head.
+	//
+	// It also sets where the ceiling is. A ship tops out near 43 m/s unladen, so a
+	// flat-out collision is 31 points against a 30-point hull — full speed into anything
+	// solid is death, and everything below it is a survivable mistake that scales.
+	HullImpactScale = 1.0
+
+	// HullImpactCooldownTicks is how long a ship is immune to further collision damage
+	// after taking some.
+	//
+	// A collision is an event, but *contact* is a state: the physics reports a touching
+	// pair every tick, so without this, holding thrust against a rock dealt damage thirty
+	// times a second — a third of a hull per tick, which killed a pilot who bumped
+	// something and did not immediately reverse. Half a second is long enough that a
+	// scrape along a surface is one hit, short enough that two genuine collisions in
+	// quick succession still both land.
+	HullImpactCooldownTicks = TickHz / 2
 )
 
 // applyRamming turns fast collisions into kills. Called from Step immediately after
@@ -76,6 +102,70 @@ func (s *Sim) resolveRam(a, b physics.EntityID) {
 	}
 	if pilotB != nil {
 		s.ramStation(pilotB, a)
+	}
+}
+
+// applyHullImpacts hurts a ship that flew into something solid, in proportion to how hard.
+//
+// Runs after applyRamming, which owns the two contacts that are *decided* by speed rather
+// than scaled by it: ship-into-ship and ship-into-enemy-station both destroy outright
+// above RamSpeedThreshold. Anything the ram pass already killed is skipped here, since
+// livePilotOf refuses a dead one — otherwise a rammed pilot would be charged twice.
+//
+// Rocks, cargo and scenery are all the same to a hull at speed, so they are all included.
+// Your own station is too: it is the thing you fly at fastest and most often, and being
+// the one solid object in the game you could belly-flop into for free made docking at a
+// hundred metres a second the correct way to deliver.
+func (s *Sim) applyHullImpacts() {
+	if !s.scoringActive() {
+		return // no damage during warmup, the shop, or after the match
+	}
+
+	for _, c := range s.lastCollisions {
+		if c.RelSpeed <= HullImpactThreshold {
+			continue
+		}
+		damage := (c.RelSpeed - HullImpactThreshold) * HullImpactScale
+
+		for i, e := range [2]physics.EntityID{c.A, c.B} {
+			pilot := s.livePilotOf(e)
+			if pilot == nil {
+				continue
+			}
+			// What it hit. Ship-on-ship is the ram rule's business, not this one.
+			other := c.B
+			if i == 1 {
+				other = c.A
+			}
+			o, ok := s.objects[other]
+			if !ok || o.Kind == KindShip {
+				continue
+			}
+			if pilot.impactCooldown > 0 {
+				continue
+			}
+
+			pilot.impactCooldown = HullImpactCooldownTicks
+			s.damageHull(pilot, damage)
+		}
+	}
+}
+
+// damageHull applies impact damage to a pilot's own ship, shield first.
+func (s *Sim) damageHull(pilot *Player, damage float32) {
+	o, ok := s.objects[pilot.Ship]
+	if !ok {
+		return
+	}
+
+	o.Health -= pilot.absorbWithShield(damage)
+	// Emitted with no shooter: the Player field is who *dealt* it, and nobody did. The
+	// client draws sparks either way, which is the point — a collision that took a third
+	// of your hull should look like something happened.
+	s.emit(Event{Type: EventShipHit, Entity: pilot.Ship, Value: damage})
+
+	if o.Health <= 0 {
+		s.destroyShipByStation(pilot, pilot.Team)
 	}
 }
 

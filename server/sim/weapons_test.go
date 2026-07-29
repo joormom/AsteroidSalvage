@@ -226,7 +226,7 @@ func TestColossalAsteroidCannotBeGrabbed(t *testing.T) {
 // This replaces a hitscan range test. "Can the beam reach 1300 m" stopped being the
 // interesting question the moment rounds had a flight time and an arc; what matters now
 // is that a shot connects at fighting range and that distance genuinely costs accuracy.
-func TestBoltsTravelAndDrop(t *testing.T) {
+func TestBoltsTravelStraight(t *testing.T) {
 	// Close enough that the arc is negligible: a flat shot must simply connect.
 	near := newBareSim(t, nil)
 	shooter := near.AddPlayer("gunner", 0)
@@ -265,14 +265,54 @@ func TestBoltsTravelAndDrop(t *testing.T) {
 		t.Error("the bolt is not moving")
 	}
 
-	// And it falls. Fired flat along +Y, it must be measurably below where it started.
+	// And it flies flat. Rounds used to arc down world -Z at 22 m/s²; fired level, one
+	// must now hold its height. A metre of slack covers the shooter's own motion being
+	// added to muzzle velocity, not an arc — a second of the old drop was 11 m.
 	air.stepN(TickHz)
 	if bolts := air.Bolts(); len(bolts) > 0 {
-		if drop := launched.Z - bolts[0].Pos.Z; drop < 5 {
-			t.Errorf("a bolt fell %.1f m in a second, want a noticeable arc", drop)
+		if dz := bolts[0].Pos.Z - launched.Z; dz < -1 || dz > 1 {
+			t.Errorf("a bolt moved %.2f m vertically in a second, want a flat trajectory", dz)
 		}
 	} else {
-		t.Error("the bolt vanished before the arc could be measured")
+		t.Error("the bolt vanished before its trajectory could be measured")
+	}
+}
+
+// A round is spent after BoltMaxRange rather than flying until it leaves the map.
+func TestBoltsExpireAtMaxRange(t *testing.T) {
+	s := newBareSim(t, nil)
+	p := s.AddPlayer("gunner", 0)
+
+	// Well above everything, so the only thing that can end this round's flight is the
+	// range cap — not a mothership it happened to run into.
+	s.world.SetPosition(p.Ship, physics.Vec3{X: 0, Y: 0, Z: 5000})
+	s.world.SetVelocity(p.Ship, physics.Vec3{})
+	s.stepN(1)
+
+	s.SetInput(p.ID, Input{Seq: 1, Fire: true})
+	s.stepN(1)
+	s.SetInput(p.ID, Input{Seq: 2}) // stop firing, so only this round is in the air
+
+	bolts := s.Bolts()
+	if len(bolts) == 0 {
+		t.Fatal("no bolt in flight the tick after firing")
+	}
+	launched := bolts[0].Pos
+
+	// At 420 m/s, 2000 m is about 4.8 seconds. Halfway there it must still be alive.
+	s.stepN(TickHz * 2)
+	if len(s.Bolts()) == 0 {
+		t.Fatalf("the round was spent inside %.0f m", BoltMaxRange/2)
+	}
+	if flown := s.Bolts()[0].Pos.Sub(launched).Len(); flown > BoltMaxRange {
+		t.Errorf("bolt flew %.0f m, past the %.0f m cap, and is still alive",
+			flown, BoltMaxRange)
+	}
+
+	// Past the cap it is gone.
+	s.stepN(TickHz * 4)
+	if n := len(s.Bolts()); n != 0 {
+		t.Errorf("%d round(s) still in flight beyond %.0f m", n, BoltMaxRange)
 	}
 }
 

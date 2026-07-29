@@ -8,6 +8,27 @@ The design reference is **R.E.P.O.** — its *feel*, not its content. Mass, mome
 fragility are the whole game: you grab a thing, it fights you, and getting it home intact
 is the challenge.
 
+## Download and play
+
+[![Download](https://img.shields.io/github/v/release/joormom/AsteroidSalvage?label=Download%20for%20Windows&style=for-the-badge)](https://github.com/joormom/AsteroidSalvage/releases/latest)
+
+**[Download the latest build](https://github.com/joormom/AsteroidSalvage/releases/latest/download/AsteroidSalvage-win64.zip)** — Windows 10 or later, ~36 MB.
+
+Unzip it anywhere and run **`AsteroidSalvage.exe`**. **Nothing to install**: no Python, no
+Go, no toolchain, no launcher account. It keeps itself up to date — see
+[Updates](#updates).
+
+That link always points at the newest release, so it is the one worth sharing.
+
+**To play together:** one player clicks HOST A GAME, sets the rules and presses START,
+which launches the bundled server and **opens a lobby**. Everyone else types the host's LAN
+address — shown along the bottom of that screen, with a COPY button — and clicks JOIN. The
+lobby fills in on the right as people arrive, and the host presses BEGIN MATCH when the
+crew is there.
+
+Everything is on your own network; there is no account, no server to rent and nothing
+phoning home except the update check.
+
 ## Architecture
 
 | Layer | Language | Why |
@@ -42,22 +63,40 @@ git submodule update --init --recursive           # pulls lagrange + libspatial
 
 Verify: `gcc --version`, `go version`, `python -c "import panda3d"`.
 
-## Sharing it
+## Updates
+
+A packaged copy **checks for a newer release on startup and installs it when you quit**,
+so a fix does not mean re-sending 36 MB and asking six people to unzip it again.
+
+The design is mostly about failure modes. The check runs on a background thread with a
+short timeout and every failure path is silent — offline, rate-limited, no releases
+published yet, a malformed reply: none of those may stop somebody playing. Nothing is
+swapped until a complete download has been extracted, so a connection dropped halfway
+leaves the installed copy untouched. A running `.exe` cannot overwrite itself on Windows,
+so the swap is done by a detached script that waits for the game to exit, copies over the
+install and relaunches.
+
+**Source checkouts are inert.** `is_frozen()` trusts `sys.frozen` and nothing else: an
+earlier version guessed from the layout around `sys.argv[0]` and got it backwards under
+`python -c`, which would have let the updater overwrite a working tree.
+
+## Publishing a release
 
 ```bash
-python build_dist.py
+python build_dist.py              # just build: dist/AsteroidSalvage-win64.zip
+python build_dist.py --release    # stamp a version, build, and publish to GitHub
 ```
 
-Produces `dist/AsteroidSalvage-win64.zip` (~34 MB). Send that to anyone on Windows 10 or
-later — they unzip it and run `AsteroidSalvage.exe`. **Nothing to install**: no Python,
-no Go, no toolchain.
+`--release` bumps the latest tag, generates `client/buildinfo.py` from it, and uploads via
+the `gh` CLI — so authentication is `gh auth login` rather than a token this repo stores.
+The version lives in the release tag alone.
 
-One player clicks HOST A GAME (which launches the bundled `server.exe` and shows their
-LAN address); everyone else types that address and clicks JOIN. `--host` skips the menu
-and goes straight into a solo game.
+Publishing is what makes the [download link](#download-and-play) point at the new build,
+and it is what every installed copy's updater notices.
 
-The build needs Go, MinGW-w64 and Python on *your* machine — not on theirs. Override
-toolchain locations with the `GO_BIN` and `MINGW_BIN` environment variables.
+The build needs Go, MinGW-w64 and Python on *your* machine — not on the players'.
+
+Override toolchain locations with the `GO_BIN` and `MINGW_BIN` environment variables.
 
 Note the game is asset-free by design: every model is generated in code. Panda3D's
 bundled models are not carried into a frozen build, and depending on them meant the
@@ -86,11 +125,69 @@ Server flags: `-addr :8080`, `-teams 4`, `-teamsize 4`, `-coop 1`, `-seed N`, `-
 | `W` / `S` | thrust forward / back |
 | `A` / `D` | strafe left / right |
 | **Mouse** | aim (there is no roll — point where you want to go and burn) |
-| **Hold right-click** | tractor beam: lock on and reel in |
+| **Right-click** | use the selected item — or, on `BEAM`, the tractor beam: lock on and reel in |
 | **Left-click** | fire the laser — the ringed crosshair shows where it goes |
 | `Shift` / `Space` | boost / brake |
-| `Tab` | release the mouse |
+| `Alt` + `A` / `D` | barrel roll left / right |
+| `Ctrl` + `W` / `S` | forward / backward roll |
+| `1` / `2` / `3` | select an item slot |
+| **Mouse wheel** | select `BEAM` or an item slot |
+| `Enter` | chat |
+| `Tab` | while chatting: switch `ALL` / `TEAM`. Otherwise release the mouse |
 | `Esc` | pause (Resume / Settings / Leave Game / Exit Game) |
+
+**This table is no longer printed across the bottom of the screen.** It was reference
+material — read once, then permanent clutter under the crosshair, sharing that corner with
+the status bars and the item hotbar. It lives in the settings screen, which is where you
+go when you want to look something up.
+
+**Every key in it can be changed**, in Settings -> Controls: click a key, press the one you
+want. See below.
+
+## Settings
+
+Three doors rather than one page: **Sound**, **Graphics** and **Controls**. One screen with
+everything on it had grown to four unrelated concerns stacked down the page, and the
+control reference at the bottom had become a table you scrolled past to reach the volume.
+
+Choices are saved to `settings.json` next to the player profile, and a command-line flag
+still wins over a saved one for that run — a flag is an explicit instruction, a saved
+setting is a preference.
+
+| Screen | What is on it |
+|---|---|
+| **Sound** | Sound and music volume. Applied as you click, not on the next match |
+| **Graphics** | Fullscreen, space dust, antialiasing, vertical sync |
+| **Controls** | Mouse sensitivity, invert Y, and every key |
+
+Fullscreen and dust apply immediately. **Antialiasing and vertical sync apply on the next
+launch** and the screen says so — both are chosen when the window is created and cannot be
+changed on a live one. Dust is the only part of the scene that is pure decoration, which
+is what makes it the one graphics option that can be turned off without changing what you
+can see of the game.
+
+### Rebinding
+
+Click a key, press the one you want. Escape cancels rather than binding Escape.
+
+Bindings live in one registry (`client/keybinds.py`) that both the flight controls and the
+game's own keys read from. They used to be hard-coded in two places, which meant "the
+controls" were a list in three files and rebinding one would have quietly desynchronised
+the others.
+
+A key can only do one thing, so **binding a key that is already taken unbinds the other
+action** rather than refusing. Refusing would mean anyone wanting to swap two keys has to
+find a spare one to park the first on; this way the displaced action shows as `- unset -`
+and is obviously the next thing to fix.
+
+Escape and the mouse buttons are **reserved**. Escape is the way out of every screen
+including that one — bound to something else, a player who made a mess of their controls
+would have no way back to fix them. The mouse buttons are wired into pointer capture and
+into the item/beam split, and binding "fire" onto "use item" would be a mess with no way
+back.
+
+Saved to `keybinds.json` the moment one changes: a rebind is fiddly enough that losing it
+to a crash would be maddening.
 
 ## Ship editor and achievements
 
@@ -99,10 +196,12 @@ tractor-beam colours. Most are locked behind achievements ("Win a match", "Deliv
 MASSIVE asteroid"), shown greyed out with the requirement rather than hidden — an item
 you can't see gives you no reason to chase it.
 
-A crew also picks a **team colour from sixteen**, on the host screen. Colour is a property
-of the team on the server rather than a launch flag, so it applies when joining someone
-else's game too, and everything that draws in team colours — hulls, stations, lasers, the
-tractor beam, the end-of-match clip — follows from one shared mapping.
+**A crew's colour comes with the crew.** There is no separate colour picker: picking a team
+already picks a colour, and two settings for one decision meant you could choose Team B and
+then paint it red, which is what Team A looks like. Everything that draws in team colours —
+hulls, stations, lasers, the tractor beam, the lobby, the end-of-match table — follows from
+one shared mapping. The sixteen-colour palette is still on the wire (`0x06 SetTeamColor`);
+nothing in the front end sends it.
 
 **Boosting is visible from outside the ship.** The plume rides on the snapshot as a body
 flag, so every client draws every ship's burn, and it never appears for a pilot holding
@@ -141,21 +240,28 @@ A massive asteroid will not move for a lone stock beam *at all* — bring a team
 buy the Tractor Amplifier. Payout splits between everyone with a beam on it, so helping
 is never charity.
 
-### Bolts travel, and they fall
+### Bolts travel, and they run out
 
-Lasers are no longer hitscan. Rounds leave the barrel at **420 m/s** and are pulled down
-world -Z at **22 m/s²**, which changes what aiming is: you lead a moving target, and at
-distance you hold high. A 300 m shot is in the air 0.7 s and falls about 5.5 m.
+Lasers are no longer hitscan. Rounds leave the barrel at **420 m/s** and fly **straight**,
+which makes aiming a question of leading a moving target and nothing else. A ship crossing
+at 40 m/s moves most of its own length in the 0.7 s a bolt takes to cross 300 m, so range
+costs accuracy in a way a damage falloff never conveys.
 
-The drop is not physics — there is no gravity out here. It is a deliberate arc so that a
-long shot is a judgement rather than a straight line, and so the reticle has something to
-be wrong about. Station turrets fire the same rounds and solve their own lead and
-elevation, which means a fast crosser can now beat a station's guns.
+Rounds used to arc downward as well, 22 m/s² along world -Z. That is gone: a shot goes
+exactly where it is pointed. There is no gravity out here, and a reticle that is wrong
+about elevation turns a long shot into a guess at how much to hold over rather than a read
+of where somebody is going.
+
+What bounds range instead is a hard limit — a round is **spent after 2000 m** and simply
+stops existing. That is a little under a fifth of the map and well past any range a fight
+happens at, so in practice it only catches shots fired into open space. It is measured as
+distance actually flown, not as a lifetime, since muzzle velocity is added to the hull's
+and a round fired from a fast ship would otherwise quietly reach further.
 
 Bolts are not physics bodies: they are swept segments tested against the same objects the
 old raycast used, and they reach clients as synthetic snapshot entries. Sending them
-rather than letting clients integrate their own arc is what keeps a near-miss from being
-drawn as a hit.
+rather than letting clients integrate their own flight is what keeps a near-miss from
+being drawn as a hit.
 
 `0x87 Shots` is now only a muzzle flash — shooter and team, five bytes. It used to carry
 length, a hit flag and a target; none of that can be known at the trigger any more, and
@@ -198,6 +304,125 @@ team-coloured wireframe bubble, so you can see what you are flying into; turrets
 themselves by shooting. Turrets reach 220 m, which is outside the deposit radius but well
 short of the belt, so they punish someone who came for the station and never plink at
 somebody working.
+
+## The lobby
+
+Hosting holds the server in a lobby instead of running a warmup clock down into round
+one, so a crew can assemble before anything is being scored. The host screen stays up
+while it fills: settings on the left, the lobby on the right, and the address you have to
+read out along the bottom where it is not competing with anything.
+
+**Your team** is picked on the same screen — `Auto` by default, since in a four-player game
+nobody wants to negotiate crews. It rides in the Hello, so it applies when joining someone
+else's game too: the server honours it while that crew has a seat and falls back to the
+emptiest one when it does not. Whichever crew you end up on is banded and marked `YOU` in
+the lobby, because everyone's name looks the same on that panel, including yours.
+
+And you can **change crew from the lobby** — click any other crew's header to move, host
+included. That is where the decision actually belongs: you can see the crews filling, so
+you can even them out. Full crews say `FULL` rather than being silently refused.
+
+Switching is **lobby-only**. Mid-match it would let somebody join whichever crew is
+winning, and would strand everything their old crew was counting on them for — their
+cargo, their share of the life pool, the station upgrades they helped pay for. The lobby is
+the one moment a crew has no state to abandon.
+
+Every crew shows **its seats, numbered and filled or empty**, so the shape of the match is
+visible before it starts rather than inferred from a headcount — and a seat has an address
+you can say out loud: "Team C, slot 2".
+
+Auto-assign fills **breadth-first**: the first player takes Team A slot 1, the second Team
+B slot 1, the third Team C, the fourth Team D, and the fifth comes back around to Team A
+slot 2. Four crews filling evenly is what makes an early game playable rather than
+three-on-one. **Team size is now enforced** —
+`Players per team` used to be a preference that the "put them on the smallest team"
+fallback quietly overran, which meant a lobby drawing four slots could seat five. A join
+with no seat left anywhere is refused.
+
+The host wears a **crown**, and is simply the first player to connect: a hosting client
+launches the server and connects before anyone else has the address, so no secret has to
+be shared between a process and the client that spawned it. Only they can start the match,
+and the crown does not move if they leave — handing it to whoever was next would let a
+joiner start a match somebody else was still setting up.
+
+Joiners see the same lobby, without the settings column: those belong to whoever launched
+the server, and a row of cyclers that changed nothing would be a worse lie than not
+showing them.
+
+## Cargo boxes
+
+Green bubbles drifting around the map with a crate in the middle. **Fly through one** to
+take what is inside — it is the only reward in the game you get by flying rather than by
+shooting or hauling, and it is the only one a fight cannot be won without leaving to
+collect.
+
+Every box looks the same. You do not know what is in one until you have it, so going for a
+box is a decision about position rather than about shopping. Once it is yours it takes its
+own colour and its own icon in one of three slots along the bottom of the screen.
+
+| Item | Effect |
+|---|---|
+| **Missile** | one shot, **25 damage**, and it **chases** — five laser hits in one, but not a kill on a full hull |
+| **Overcharge** | **+50% laser damage** for 30 seconds |
+| **Afterburner** | **+50% thrust** for 30 seconds |
+| **Shield** | absorbs the next **30 damage**, and then it is gone |
+
+Each answers a different question rather than being a bigger number than the last:
+Overcharge rewards already being in a fight, Afterburner rewards not being in one yet, and
+the Shield is the only one worth holding rather than spending.
+
+**Selecting and firing are separate.** `1`-`3` and the wheel *select* a slot;
+**right-click commits**. Firing on the key press meant a missile left the rail the instant
+it was chosen, with the ship pointing wherever it happened to be pointing — there was no
+moment in which to aim it. One rule for every item, and the missile gets a moment.
+
+The fourth selection is `BEAM`, and it is the default — with nothing selected, right-click
+is the tractor beam it has always been. Without that state, picking up an item would
+silently take your beam away and the first you would know is a rock you failed to grab.
+The wheel cycles `BEAM → 1 → 2 → 3`, so getting back to the beam is never more than three
+clicks in one direction.
+
+### The missile chases
+
+It **locks on at launch** — the enemy ship closest to where you were pointing, by aim angle
+rather than by distance, so a nearer ship off to the side cannot steal the lock. Nothing in
+the cone means it flies straight rather than refusing to launch. It never re-acquires: a
+missile that kept shopping for a better target would be impossible to bait, and baiting one
+is the interesting half of being shot at.
+
+It is also **dodgeable**, and one number decides that: it can bend its course by **1.6
+rad/s** and no faster. At nearly three times a boosting ship's top speed it can always
+catch up, so dodging is never about outrunning it — it is about making it turn. Break
+across its path late and it overshoots, then has to come back around, and its range cap
+eventually spends it.
+
+**Shields do not stack.** Using one while another is up replaces what was left rather than
+adding to it, so the pool is always 30 and never a number that climbs — spending a second
+shield early is a choice to waste some of the first. It draws as its own bar **above the
+hull**, since that is the layer damage reaches first, and only while one is actually up.
+
+Three slots, and a fourth box is refused rather than overwriting one — a box you flew
+through and did not get is annoying, but a missile that vanished because you clipped an
+Afterburner on the way to a fight is worse. **Dying spends everything**, carried and
+running: an item is a window, and one that survives a respawn is a permanent upgrade with
+extra steps.
+
+A missile's 25 damage is fixed. It does not scale with the laser upgrades or with
+Overcharge, so what it is worth never depends on what else you happen to be holding.
+
+## Chat
+
+`Enter` opens the composer, `Esc` cancels, and **`Tab` switches between `ALL` and `TEAM`
+while you are typing** — you start typing and then decide who hears it, rather than
+picking a channel first and discovering afterwards that you sent it to the room.
+
+Team messages go to the team room on the server and nowhere else. The sender's name and
+crew are attached by the server from the session, never carried up from the message, so no
+client can put words in somebody else's mouth or claim a crew it is not on.
+
+The composer takes the keyboard while it is open; without that, typing "was" would thrust,
+strafe and brake on the way past. Anything held when it opened is released, so a key does
+not stay down for as long as the message takes to write.
 
 ## Game modes
 
@@ -265,6 +490,42 @@ they are cover to break line of sight behind and landmarks to navigate by, in a 
 that was otherwise uniform in every direction. Generation is fully deterministic in the
 seed, so a host can share a map and a generation bug can be reproduced rather than hunted.
 
+### Aerobatics
+
+`Alt` turns `A`/`D` into a barrel roll about the nose; `Ctrl` turns `W`/`S` into a
+forward or backward roll. Both **repurpose the movement keys** rather than adding new ones,
+so your hand stays where it is — and you cannot strafe while rolling or thrust while
+flipping, which is the honest trade. A ship doing an aerobatic manoeuvre is committing to
+it.
+
+There is a subtlety worth knowing if you rebind anything: Panda3D normally folds held
+modifiers into event names, so `Ctrl`+`W` arrives as `control-w` and a plain `w` binding
+never fires. That is switched off, which is also what makes `Shift`-to-boost work while
+already thrusting.
+
+### Flying into things
+
+Above **12 m/s** — the same speed cargo starts taking impact damage at — a collision hurts
+the hull, and it scales: **every metre per second over twelve costs a hull point**. A
+30 m/s scrape is 18 of your 30 points and survivable; a ship tops out near 43 m/s, so
+**flat out into anything solid is death**.
+
+Rocks, cargo, scenery and your own station all count. Your own station especially: it is
+the thing you fly at fastest and most often, and being the one solid object you could
+belly-flop into for free made docking at a hundred metres a second the correct way to
+deliver.
+
+Damage lands **once per collision, not once per tick of contact** — half a second of
+immunity afterwards. Without that, holding thrust against a rock dealt a third of a hull
+thirty times a second, and a pilot who bumped something and did not instantly reverse
+simply died. Item shields absorb it like any other damage.
+
+Every hit — laser, missile, collision, or a station shield eating a round — now throws a
+**spark on the surface that was struck**, sized by the damage. Where the shot's origin is
+known the flash is offset onto the near face rather than the body's centre: a flash inside
+a 40 m asteroid is a faint glow somewhere in the middle of it, which reads as nothing at
+all.
+
 ### Ramming
 
 Flying your hull into something at speed is a weapon, above a 10 m/s closing speed so a
@@ -328,8 +589,20 @@ yourself. They count up on the *team*, so a shield a crewmate paid for in round 
 still there for someone who joins in round three, and two people buying it does not get
 you two shields.
 
+When the match ends, the losing stations blow up and then a **results table** takes the
+screen: round wins per crew, and a row per pilot — delivered, banked, kills/deaths and
+credits, with your own row picked out in your crew's colour. Stats are match totals rather
+than per round, because a round you lost is still work you did. A rock two people hauled
+counts as a delivery for both, each worth the share they were actually paid, which is how
+the payout already splits.
+
+This is the one message that shows everyone's earnings. During a match they are sent per
+session precisely so rivals cannot see what each other can afford in the shop — but that
+is a mid-match concern, and by the time this table appears there is no shop left to open.
+
 Server flags for pacing: `-bestof 5 -round 180 -intermission 45 -warmup 15 -lives 12`, or
-`-sandbox` for one endless round with no clock or shop.
+`-sandbox` for one endless round with no clock or shop. `-lobby` holds the server in a
+lobby until the host starts it, which is what HOST A GAME passes.
 
 **HOST A GAME owns the server.** It launches one with the settings on that screen, so
 those settings only apply to a server it started. If something is already listening on the
@@ -348,10 +621,18 @@ go run ./bots -n 16 -seconds 60                 # 16-player load test
 python client/smoke_test.py                     # Python client vs the real Go server
 python client/playtest.py                       # full loop: grab a rock, deliver it
 python client/soaktest.py --seconds 300         # connection stability over time
+python client/protocol_test.py                  # Python decoders vs Go's literal bytes
+python client/itemtest.py                       # fly through a cargo box, spend the item
+python client/chattest.py                       # three clients: ALL vs TEAM routing
 python tools/devconsole/main.py --frames 120    # console renders without error
 
 # See what the game actually looks like, without a human at the keyboard:
 python client/main.py --demo --shot out.png --shot-frames 300 --shot-hauling
+python client/main.py --host --shot bin/lobby.png --shot-lobby --shot-frames 600
+python client/main.py --join 192.168.1.42 --shot bin/joined.png --shot-lobby
+python client/main.py --url ... --demo --shot bin/results.png --shot-results
+python client/main.py --host --demo --demo-items --shot bin/hotbar.png  # items in hand
+python client/main.py --host --shot bin/chat.png --shot-chat            # log + composer
 python client/preview.py --model mothership --out bin/ms.png   # a model on its own
 ```
 
@@ -360,9 +641,18 @@ python client/preview.py --model mothership --out bin/ms.png   # a model on its 
 shows the mechanic rather than a ship parked at spawn. Capturing the desktop from
 outside is unreliable; it photographs whichever window is on top.
 
+`--shot-lobby` opens a real lobby and photographs it rather than starting the match, so
+the roster can be checked with players actually in it — point `go run ./bots -n 6` at the
+same server to fill the seats. `--join` is the mirror of `--host`: it drives the menu's
+JOIN button rather than connecting behind the menu's back, which is the only way to
+exercise what a joiner actually sees. `--url` skips the front end entirely and cannot.
+
 The smoke test matters more than it looks: Go and Python implement the wire protocol
 independently, and drift between them is the most likely bug in this project.
 `TestPythonEncodersDecodeInGo` pins the other direction with literal bytes.
+`protocol_test.py` covers the messages a running match never exchanges — a match has to
+*end* before `0x88` is sent and a lobby has to be *opened* before `0x89` is, so neither
+would ever be reached by the smoke test.
 
 ## Tuning the feel
 
@@ -440,10 +730,11 @@ config/feel.toml      tuned values
 
 ## Status
 
-Playable end to end: fly, grab, haul, bank, shoot, break rocks open for their cores,
-siege a rival's station, waves escalate, teams score, co-op works. 16 concurrent bots
-sustain 15 Hz with zero errors.
+Playable end to end: assemble in a lobby, fly, grab, haul, bank, shoot, break rocks open
+for their cores, collect cargo boxes and spend what is in them, talk to your crew, siege a
+rival's station, waves escalate, teams score, co-op works, and the match finishes on a
+results table. 16 concurrent bots sustain 15 Hz with zero errors.
 
-Not built yet: lobby and ready-up, an end-of-match results screen (the losing stations
-already blow up; there is no scoreboard after it), client-side prediction, and interest
-management (deferred until profiling demands it).
+Not built yet: ready-up (the lobby shows who is here, but nobody marks themselves ready —
+the host just starts it), client-side prediction, and interest management (deferred until
+profiling demands it).
