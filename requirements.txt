@@ -1,0 +1,8 @@
+# Runtime dependencies of the game client.
+#
+# Panda3D's build_apps packager reads this to decide what to bundle into the frozen
+# app, so it must list everything the client imports at runtime — not the dev-only
+# tools. numpy and imgui-bundle are deliberately absent: they are only used by
+# tools/devconsole, which is not shipped.
+panda3d==1.10.16
+websockets==16.1.1

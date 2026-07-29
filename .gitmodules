@@ -1,0 +1,3 @@
+[submodule "vendor/lagrange"]
+	path = vendor/lagrange
+	url = https://github.com/kevinfling/lagrange.git

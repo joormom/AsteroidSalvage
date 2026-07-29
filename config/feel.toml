@@ -1,0 +1,20 @@
+# Tuned feel values for Asteroid Salvage.
+# Written by the dev console (tools/devconsole). Safe to edit by hand.
+# Parameter meanings and ranges: shared/protocol.md
+#
+# These are starting points, not answers. The whole reason the dev console exists is
+# that grab feel has to be found by playing, not by reasoning. Run the server with
+# -dev, open the console, fly, and drag sliders until hauling feels heavy.
+
+grab.damping = 28
+grab.hold_distance = 6
+grab.max_force = 1800
+grab.range = 15
+grab.reaction_scale = 1
+grab.spring = 220
+salvage.damage_scale = 0.04
+salvage.damage_threshold = 12
+ship.angular_damping = 900
+ship.linear_damping = 0.35
+ship.thrust = 1800
+ship.torque = 1400
