@@ -8,6 +8,27 @@ The design reference is **R.E.P.O.** — its *feel*, not its content. Mass, mome
 fragility are the whole game: you grab a thing, it fights you, and getting it home intact
 is the challenge.
 
+## Download and play
+
+[![Download](https://img.shields.io/github/v/release/joormom/AsteroidSalvage?label=Download%20for%20Windows&style=for-the-badge)](https://github.com/joormom/AsteroidSalvage/releases/latest)
+
+**[Download the latest build](https://github.com/joormom/AsteroidSalvage/releases/latest/download/AsteroidSalvage-win64.zip)** — Windows 10 or later, ~36 MB.
+
+Unzip it anywhere and run **`AsteroidSalvage.exe`**. **Nothing to install**: no Python, no
+Go, no toolchain, no launcher account. It keeps itself up to date — see
+[Updates](#updates).
+
+That link always points at the newest release, so it is the one worth sharing.
+
+**To play together:** one player clicks HOST A GAME, sets the rules and presses START,
+which launches the bundled server and **opens a lobby**. Everyone else types the host's LAN
+address — shown along the bottom of that screen, with a COPY button — and clicks JOIN. The
+lobby fills in on the right as people arrive, and the host presses BEGIN MATCH when the
+crew is there.
+
+Everything is on your own network; there is no account, no server to rent and nothing
+phoning home except the update check.
+
 ## Architecture
 
 | Layer | Language | Why |
@@ -42,24 +63,40 @@ git submodule update --init --recursive           # pulls lagrange + libspatial
 
 Verify: `gcc --version`, `go version`, `python -c "import panda3d"`.
 
-## Sharing it
+## Updates
+
+A packaged copy **checks for a newer release on startup and installs it when you quit**,
+so a fix does not mean re-sending 36 MB and asking six people to unzip it again.
+
+The design is mostly about failure modes. The check runs on a background thread with a
+short timeout and every failure path is silent — offline, rate-limited, no releases
+published yet, a malformed reply: none of those may stop somebody playing. Nothing is
+swapped until a complete download has been extracted, so a connection dropped halfway
+leaves the installed copy untouched. A running `.exe` cannot overwrite itself on Windows,
+so the swap is done by a detached script that waits for the game to exit, copies over the
+install and relaunches.
+
+**Source checkouts are inert.** `is_frozen()` trusts `sys.frozen` and nothing else: an
+earlier version guessed from the layout around `sys.argv[0]` and got it backwards under
+`python -c`, which would have let the updater overwrite a working tree.
+
+## Publishing a release
 
 ```bash
-python build_dist.py
+python build_dist.py              # just build: dist/AsteroidSalvage-win64.zip
+python build_dist.py --release    # stamp a version, build, and publish to GitHub
 ```
 
-Produces `dist/AsteroidSalvage-win64.zip` (~34 MB). Send that to anyone on Windows 10 or
-later — they unzip it and run `AsteroidSalvage.exe`. **Nothing to install**: no Python,
-no Go, no toolchain.
+`--release` bumps the latest tag, generates `client/buildinfo.py` from it, and uploads via
+the `gh` CLI — so authentication is `gh auth login` rather than a token this repo stores.
+The version lives in the release tag alone.
 
-One player clicks HOST A GAME, sets the rules and presses START, which launches the
-bundled `server.exe` and **opens a lobby**; everyone else types the host's LAN address —
-shown along the bottom of that screen, with a COPY button — and clicks JOIN. The lobby
-fills in on the right as people arrive, and the host presses BEGIN MATCH when the crew is
-there. `--host` skips all of it and goes straight into a solo game.
+Publishing is what makes the [download link](#download-and-play) point at the new build,
+and it is what every installed copy's updater notices.
 
-The build needs Go, MinGW-w64 and Python on *your* machine — not on theirs. Override
-toolchain locations with the `GO_BIN` and `MINGW_BIN` environment variables.
+The build needs Go, MinGW-w64 and Python on *your* machine — not on the players'.
+
+Override toolchain locations with the `GO_BIN` and `MINGW_BIN` environment variables.
 
 Note the game is asset-free by design: every model is generated in code. Panda3D's
 bundled models are not carried into a frozen build, and depending on them meant the
