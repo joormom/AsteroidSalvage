@@ -39,6 +39,7 @@ from pause import PauseMenu  # noqa: E402
 from playerprofile import Profile  # noqa: E402
 from render import SceneRenderer  # noqa: E402
 from shop import Shop  # noqa: E402
+import updater  # noqa: E402
 
 INPUT_HZ = 30.0
 
@@ -139,6 +140,11 @@ class Game(ShowBase):
         self.accept("escape", self._on_escape)
         self.taskMgr.add(self._tick, "client-tick")
 
+        # Look for a newer build in the background. Inert in a source checkout, and it
+        # can never delay or block startup — see updater.py.
+        self._update_ready = None
+        updater.check(self._on_update_ready)
+
         if args.url:
             # An explicit --url skips the menu, which keeps the automated tests and the
             # --demo autopilot working exactly as before.
@@ -152,6 +158,15 @@ class Game(ShowBase):
                 # Straight into a solo game: start the bundled server and connect. Also
                 # how the packaged build's hosting path gets exercised automatically.
                 self.taskMgr.doMethodLater(0.2, self._auto_host, "auto-host")
+
+    def _on_update_ready(self, version: str, staged: str) -> None:
+        """A newer build is downloaded and waiting. Called from the updater's thread.
+
+        Nothing is installed mid-session: swapping files under a running game would be
+        rude at best. The player is told, and the swap happens when they quit.
+        """
+        self._update_ready = staged
+        self.hud.show_toast(f"UPDATE {version} READY  -  installs when you quit", 8.0)
 
     def _auto_host(self, task):
         if self.menu is not None:
@@ -797,6 +812,12 @@ class Game(ShowBase):
         for owner in (self.menu, self._server_owner):
             if owner is not None:
                 owner.stop_server()
+
+        # Hand off to the updater on the way out, once nothing is holding the game's own
+        # files open. It relaunches when it is done.
+        if self._update_ready:
+            updater.apply_and_restart(self._update_ready)
+
         super().userExit()
 
 

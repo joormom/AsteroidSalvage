@@ -39,6 +39,10 @@ setup(
                     # Reached only through a local import inside Menus, which the
                     # freezer's static analysis does not follow.
                     "shipeditor",
+                    # Generated at build time and imported lazily inside updater.py,
+                    # so nothing the freezer can see points at either of them.
+                    "buildinfo",
+                    "updater",
                 ]
             },
             # Trim the download: the client renders and talks WebSocket, nothing else.
