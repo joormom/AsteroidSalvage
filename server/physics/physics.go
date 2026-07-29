@@ -122,6 +122,15 @@ func (w *World) SpawnSphere(mass, radius float32, pos Vec3) EntityID {
 }
 
 // SpawnBox adds a box body given its half-extents. mass <= 0 creates a static body.
+//
+// **A box does not collide with anything.** ag_resolve_collisions in bridge.c skips every
+// collider that is not LG_SHAPE_SPHERE, because lagrange's own narrow phase is bypassed
+// (its contact normals are inverted relative to its resolver) and the replacement only
+// implements sphere-sphere. A body spawned here will fall through the world silently,
+// which is a worse failure than a compile error — hence this note rather than removing it.
+//
+// Nothing in the game uses it. Anything that needs to be solid is a sphere, or a cluster
+// of them.
 func (w *World) SpawnBox(mass float32, half Vec3, pos Vec3) EntityID {
 	return EntityID(C.ag_spawn_box(w.w,
 		C.float(mass),

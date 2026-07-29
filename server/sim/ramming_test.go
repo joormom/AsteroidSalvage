@@ -242,3 +242,23 @@ func TestTheShieldAbsorbsCollisionDamage(t *testing.T) {
 		t.Errorf("shield is on %.1f, want %.1f", p.Effects.Shield, ShieldPool-20)
 	}
 }
+
+// Your own station has to be safe to fly into. At boost a contact is far more than a
+// hull's worth of damage, so before this every fast return home ended in death on the
+// doorstep — and nothing was being exploited, since cargo banks 60 m out.
+func TestFlyingIntoYourOwnStationIsHarmless(t *testing.T) {
+	s := newBareSim(t, nil)
+	p := s.AddPlayer("hauler", 0)
+
+	home := s.motherships[p.Team]
+	full := s.objects[p.Ship].Health
+
+	ramInto(s, p.Ship, home, RamSpeedThreshold*3, 40)
+
+	if p.Dead() {
+		t.Error("flying into your own station at speed destroyed the ship")
+	}
+	if got := s.objects[p.Ship].Health; got != full {
+		t.Errorf("took %.1f damage from its own station", full-got)
+	}
+}

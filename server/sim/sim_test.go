@@ -672,7 +672,12 @@ func TestShipsBounceOffMothership(t *testing.T) {
 // Bouncing off a fast approach is easy; the failure mode that matters is grinding
 // slowly against it under continuous thrust until you creep through the shell.
 func TestCannotFlyInsideMothership(t *testing.T) {
-	const hull = 30.0 // mothership collider radius
+	// Against the COLLIDER, not the hull the client draws — they are deliberately
+	// different sizes, and this test used to hard-code 30 for both. Physics can only
+	// express spheres, so the collider is the largest one that fits inside a flattened
+	// saucer; flying inside the drawn rim is the accepted cost of nothing invisible being
+	// solid. See MothershipColliderRadius.
+	const hull = MothershipColliderRadius
 	const minGap = hull + ShipRadius - 1.5
 
 	// Drives with real thrust input, the way a player does. Forcing velocity directly
@@ -704,12 +709,12 @@ func TestCannotFlyInsideMothership(t *testing.T) {
 		if boost {
 			label = "boosted thrust"
 		}
-		t.Logf("%s straight at the mothership: closest %.1f m from centre (hull %.0f m)",
-			label, closest, hull)
+		t.Logf("%s at the mothership: closest %.1f m from centre (collider %.1f m, drawn hull %.0f m)",
+			label, closest, float32(hull), float32(MothershipRadius))
 
 		if closest < minGap {
 			t.Errorf("%s put the ship %.1f m from the mothership centre — it is "+
-				"penetrating the hull", label, closest)
+				"penetrating the collider", label, closest)
 		}
 	}
 }

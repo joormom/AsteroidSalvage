@@ -31,8 +31,28 @@ const (
 	ShipMass   = 120.0
 	ShipRadius = 2.0
 
-	// MothershipRadius is the hull; the capture volume is Config.DepositRadius.
+	// MothershipRadius is the hull as everything *sees* it: the snapshot radius the client
+	// scales the model by, and what a laser is tested against. The capture volume is
+	// Config.DepositRadius.
 	MothershipRadius = 30.0
+
+	// MothershipColliderRadius is the sphere the physics world actually uses, and it is
+	// deliberately much smaller. **Stopgap.**
+	//
+	// The station model is a flattened saucer — an ellipsoid 30 m across and 12.6 m tall —
+	// but ag_resolve_collisions in bridge.c only resolves sphere-sphere contacts, so a
+	// collider can only ever be a sphere. At the full 30 m that left roughly 17 m of solid
+	// nothing above and below the saucer: you flew over your own station, hit an invisible
+	// wall, and once collisions started doing damage by speed that killed you.
+	//
+	// 12.6 m is the largest sphere that fits entirely inside the visible hull, so nothing
+	// invisible can be hit any more. The cost is the opposite error, and a cosmetic one:
+	// the outer rim of the saucer is now flown through rather than bounced off.
+	//
+	// The real fix is a ring station — a circle of sphere colliders matching a rebuilt
+	// model, with the rim solid and the middle open — which needs the model, the colliders
+	// and the parenting of shots and rams all changed together.
+	MothershipColliderRadius = 12.6
 
 	// MothershipRing is how far each team's mothership sits from the centre. Far
 	// enough apart that a team's home is defensible and worth flying back to, close
@@ -541,8 +561,9 @@ func New(cfg Config) (*Sim, error) {
 		team := uint8(i)
 		pos := s.mothershipPos(team, teamCount)
 
-		// Static: a destination, not a physics participant.
-		e := w.SpawnSphere(0, MothershipRadius, pos)
+		// Static: a destination, not a physics participant. The collider is smaller than
+		// the hull the client draws — see MothershipColliderRadius.
+		e := w.SpawnSphere(0, MothershipColliderRadius, pos)
 		// Without this the mothership keeps lagrange's default 0.3 restitution, and
 		// since contacts take the minimum, every ship that touched it barely bounced.
 		w.SetMaterial(e, ShipRestitution, 0.25)

@@ -141,6 +141,17 @@ func (s *Sim) applyHullImpacts() {
 			if !ok || o.Kind == KindShip {
 				continue
 			}
+			// Your own station is not a hazard. It is the thing you fly at hardest and
+			// most often, and at boost a contact is 70-odd damage against a 30 hull —
+			// every fast return home ended in death at your own front door.
+			//
+			// Nothing is exploited by making it safe: the deposit radius is 60 m, so
+			// cargo banks well before you reach the hull and there was never a reason to
+			// touch it. An *enemy* station is still a ram, which costs the ship on
+			// purpose — see ramStation.
+			if o.Kind == KindMothership && o.Team == pilot.Team {
+				continue
+			}
 			if pilot.impactCooldown > 0 {
 				continue
 			}
