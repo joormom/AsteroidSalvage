@@ -22,6 +22,10 @@ MSG_BUY_UPGRADE = 0x03
 MSG_BUY_OFFER = 0x04
 MSG_SET_TEAM_NAME = 0x05
 MSG_SET_TEAM_COLOR = 0x06
+MSG_START_MATCH = 0x07
+MSG_USE_ITEM = 0x08
+MSG_CHAT = 0x09
+MSG_SET_TEAM = 0x0A
 MSG_DEBUG_SET = 0x10
 
 MSG_WELCOME = 0x80
@@ -32,13 +36,27 @@ MSG_MATCH_STATE = 0x84
 MSG_PLAYER_STATE = 0x85
 MSG_SHOP_OFFERS = 0x86
 MSG_SHOTS = 0x87
+MSG_MATCH_RESULTS = 0x88
+MSG_ROSTER = 0x89
+MSG_CHAT_SAY = 0x8A
 MSG_DEBUG_STATS = 0x90
+
+# Chat channels.
+CHAT_ALL = 0
+CHAT_TEAM = 1
+
+# Longest message the server will relay. Enforced there too — this is so the composer can
+# stop accepting characters rather than silently truncating on send.
+CHAT_MAX_BYTES = 120
 
 # Match phases.
 PHASE_WARMUP = 0
 PHASE_ROUND = 1
 PHASE_INTERMISSION = 2
 PHASE_MATCH_OVER = 3
+# Held open for players to join. Only reached when the server is run with -lobby, and it
+# has no clock: it ends when the host starts the match and not otherwise.
+PHASE_LOBBY = 4
 
 # Game modes. Rules live in server/sim/modes.go; these are for display and for the host
 # screen, which offers a different options panel per mode.
@@ -91,10 +109,14 @@ STATION_UPGRADES = (UPGRADE_SHIELDS, UPGRADE_TURRETS)
 # actually being told about ("18 / 30"). They mirror sim.ShipMaxHealth and
 # sim.MothershipMaxHealth — if those move and these do not, the bars stay correct and only
 # the labels lie.
-# Bolt flight, mirroring sim.BoltSpeed and sim.BoltDrop. Clients need these to aim: a
-# round travels and falls, so hitting anything at range means leading it and holding high.
+# Bolt flight, mirroring sim.BoltSpeed and sim.BoltMaxRange. Rounds fly straight, so
+# aiming is purely a matter of leading a moving target — there is no hold-over.
+#
+# There was a BOLT_DROP here, and it read 36.0 against the server's 22.0: nothing aimed
+# with it well enough for the disagreement to show, which is exactly how a mirrored
+# constant goes bad. Dropping the arc removes the constant that had to be kept in step.
 BOLT_SPEED = 420.0
-BOLT_DROP = 36.0
+BOLT_MAX_RANGE = 2000.0
 
 SHIP_MAX_HEALTH = 30.0
 MOTHERSHIP_MAX_HEALTH = 500.0
@@ -227,15 +249,60 @@ KIND_HAZARD = 4
 # tier byte carries which structure to draw. See server/sim/props.go and client/props.py.
 KIND_PROP = 5
 
-# A laser round in flight. Not a physics body on the server — bolts travel and fall, and
-# they arrive as synthetic snapshot entries so what you see is what the server resolves
-# against. See server/sim/projectiles.go.
+# A round in flight. Not a physics body on the server — rounds travel, and they arrive as
+# synthetic snapshot entries so what you see is what the server resolves against. The tier
+# byte separates a laser bolt (0) from an item missile (1).
+# See server/sim/projectiles.go.
 KIND_BOLT = 6
+BOLT_LASER = 0
+BOLT_MISSILE = 1
+
+# A cargo box drifting in a bubble. Not a physics body either: you fly through one to
+# collect it rather than bouncing off it. The tier byte carries which ITEM_* is inside.
+# See server/sim/items.go.
+KIND_PICKUP = 7
 
 PROP_BATTLESTATION = 0
 PROP_CAPITAL_WRECK = 1
 PROP_PLANET_CHUNK = 2
 PROP_STATION_RUIN = 3
+
+# --- items ------------------------------------------------------------------
+#
+# Carried in three slots, used by slot with 0x08 UseItem. Mirrors sim.ItemID.
+
+ITEM_NONE = 0
+ITEM_MISSILE = 1
+ITEM_DAMAGE = 2
+ITEM_SPEED = 3
+ITEM_SHIELD = 4
+
+ITEM_SLOTS = 3
+
+# What a crew is called until somebody renames it. Mirrors sim.DefaultTeamName, and used
+# by the host screen's team picker before any TeamState has arrived to say otherwise.
+DEFAULT_TEAM_NAMES = ["Team A", "Team B", "Team C", "Team D"]
+
+# name, short label for the hotbar, and what it does — for the HUD and the tooltip.
+ITEM_INFO = {
+    ITEM_MISSILE: ("Missile", "MSL", "one shot, 25 damage"),
+    ITEM_DAMAGE: ("Overcharge", "DMG", "+50% laser damage for 30s"),
+    ITEM_SPEED: ("Afterburner", "SPD", "+50% thrust for 30s"),
+    ITEM_SHIELD: ("Shield", "SHD", "absorbs the next 30 damage"),
+}
+
+# Every cargo box in the world is this colour, whatever is inside it. A box is a surprise
+# until you have it, so going for one is a decision about position rather than shopping.
+PICKUP_COLOR = (0.45, 1.00, 0.55)
+
+# Per-item colours, used on the hotbar only — once an item is yours, telling the three
+# slots apart at a glance matters more than the mystery does.
+ITEM_COLORS = {
+    ITEM_MISSILE: (1.00, 0.55, 0.30),
+    ITEM_DAMAGE: (1.00, 0.35, 0.35),
+    ITEM_SPEED: (0.40, 0.85, 1.00),
+    ITEM_SHIELD: (0.55, 1.00, 0.65),
+}
 
 # --- event types ------------------------------------------------------------
 
@@ -262,6 +329,10 @@ EVENT_MOTHERSHIP_DESTROYED = 14  # value carries the destroyed team
 EVENT_SHIELD_ABSORBED = 15  # value carries the damage the shield ate
 EVENT_TEAM_ELIMINATED = 16  # value carries the team id of the last crew standing
 EVENT_HILL_MOVED = 17  # the King of the Hill zone relocated; value carries its radius
+
+# Cargo boxes. Value carries the ITEM_* id in both cases.
+EVENT_ITEM_PICKED_UP = 18
+EVENT_ITEM_USED = 19
 
 BODY_RECORD_SIZE = 27
 
@@ -330,6 +401,8 @@ _INPUT = struct.Struct("<BIffffffB")
 _WELCOME = struct.Struct("<IIBBB")
 _EVENT = struct.Struct("<BIIf")
 _TEAM = struct.Struct("<BfB")
+_RESULT_HEAD = struct.Struct("<IBB")  # player_id, team, name_len
+_RESULT_TAIL = struct.Struct("<HfHHf")  # delivered, banked, kills, deaths, credits
 _DEBUG_STATS = struct.Struct("<fHH")
 _DEBUG_SET = struct.Struct("<BHf")
 
@@ -630,6 +703,129 @@ def decode_match_state(body: bytes) -> MatchState:
 
 
 @dataclass(slots=True)
+class RosterEntry:
+    """One seat in the lobby."""
+
+    player_id: int
+    team: int
+    name: str
+
+
+@dataclass(slots=True)
+class Roster:
+    host_id: int  # the only player the server accepts a start from; 0 = nobody yet
+    capacity: int  # seats per crew, so the lobby can draw empty ones
+    players: list[RosterEntry] = field(default_factory=list)
+
+    def by_team(self, team: int) -> list[RosterEntry]:
+        return [r for r in self.players if r.team == team]
+
+
+def decode_roster(body: bytes) -> Roster:
+    host_id = _U32.unpack_from(body, 0)[0]
+    capacity, n = body[4], body[5]
+
+    out: list[RosterEntry] = []
+    off = 6
+    for _ in range(n):
+        pid = _U32.unpack_from(body, off)[0]
+        team, name_len = body[off + 4], body[off + 5]
+        off += 6
+        name = body[off : off + name_len].decode("utf-8", "replace")
+        off += name_len
+        out.append(RosterEntry(pid, team, name))
+    return Roster(host_id, capacity, out)
+
+
+def encode_start_match() -> bytes:
+    """Ask the server to leave the lobby. Ignored from anyone but the host."""
+    return bytes([MSG_START_MATCH])
+
+
+def encode_set_team(team: int) -> bytes:
+    """Move to another crew. Accepted in the lobby only, and only if it has a seat."""
+    return bytes([MSG_SET_TEAM, team & 0xFF])
+
+
+def encode_use_item(slot: int) -> bytes:
+    """Spend whatever is in an inventory slot. A no-op on the server if it is empty."""
+    return bytes([MSG_USE_ITEM, slot & 0xFF])
+
+
+def encode_chat(channel: int, text: str) -> bytes:
+    raw = text.encode("utf-8")[:CHAT_MAX_BYTES]
+    return bytes([MSG_CHAT, channel & 0xFF, len(raw)]) + raw
+
+
+@dataclass(slots=True)
+class ChatSay:
+    """A message on its way in. Name and team come from the server, not the sender."""
+
+    channel: int
+    team: int
+    name: str
+    text: str
+
+
+def decode_chat_say(body: bytes) -> ChatSay:
+    channel, team = body[0], body[1]
+    n = body[2]
+    name = body[3 : 3 + n].decode("utf-8", "replace")
+
+    off = 3 + n
+    t = body[off]
+    off += 1
+    text = body[off : off + t].decode("utf-8", "replace")
+    return ChatSay(channel, team, name, text)
+
+
+@dataclass(slots=True)
+class MatchResult:
+    """One pilot's row on the end-of-match screen."""
+
+    player_id: int
+    team: int
+    name: str
+    delivered: int  # rocks banked over the whole match, not this round
+    banked: float  # their total value
+    kills: int
+    deaths: int
+    credits: float
+
+
+@dataclass(slots=True)
+class MatchResults:
+    winner: int  # 0xFF = draw
+    players: list[MatchResult] = field(default_factory=list)
+
+
+def decode_match_results(body: bytes) -> MatchResults:
+    """Parse a 0x88. Rows arrive pre-sorted; keep the order the server sent.
+
+    Re-sorting here would defeat the point of sorting there — every client is meant to
+    draw the same table.
+    """
+    winner = body[0]
+    n = body[1]
+
+    out: list[MatchResult] = []
+    off = 2
+    for _ in range(n):
+        pid, team, name_len = _RESULT_HEAD.unpack_from(body, off)
+        off += _RESULT_HEAD.size
+        name = body[off : off + name_len].decode("utf-8", "replace")
+        off += name_len
+
+        delivered, banked, kills, deaths, credits = _RESULT_TAIL.unpack_from(body, off)
+        off += _RESULT_TAIL.size
+
+        out.append(
+            MatchResult(pid, team, name, delivered, banked, kills, deaths, credits)
+        )
+    return MatchResults(winner, out)
+
+
+@dataclass(slots=True)
 class PlayerState:
     credits: float
     upgrades: dict[int, int] = field(default_factory=dict)
@@ -650,6 +846,14 @@ class PlayerState:
     # The team's life pool ran out on this player's death, so no respawn is coming. Not
     # inferable from respawn_in: a grounded player's countdown is zero, same as alive.
     grounded: bool = False
+
+    # Three inventory slots and the effects the used ones are running. items holds
+    # ITEM_* ids, ITEM_NONE for empty; the boosts are seconds remaining and item_shield
+    # is damage the shield can still absorb rather than a timer.
+    items: list[int] = field(default_factory=lambda: [ITEM_NONE] * ITEM_SLOTS)
+    item_damage: float = 0.0
+    item_speed: float = 0.0
+    item_shield: float = 0.0
 
     @property
     def boost_stalled(self) -> bool:
@@ -685,6 +889,13 @@ def decode_player_state(body: bytes) -> PlayerState:
         ps.boost_cooldown = _F32.unpack_from(body, off + 24)[0]
     if len(body) >= off + 29:
         ps.grounded = body[off + 28] != 0
+    # Inventory and item effects, appended after the combat block for the same reason it
+    # was appended after the upgrade table: a decoder that stops earlier still works.
+    if len(body) >= off + 29 + ITEM_SLOTS + 12:
+        o = off + 29
+        ps.items = list(body[o : o + ITEM_SLOTS])
+        o += ITEM_SLOTS
+        ps.item_damage, ps.item_speed, ps.item_shield = struct.unpack_from("<fff", body, o)
     return ps
 
 

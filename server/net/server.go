@@ -201,14 +201,48 @@ func (s *Server) appendHillBody() {
 // own flight path without needing the vector itself.
 func (s *Server) appendBoltBodies() {
 	for _, b := range s.sim.Bolts() {
+		// A missile rides the tier byte, the same trick props use for their structure
+		// type: same kind, different thing to draw, no new field on every body record.
+		tier := uint8(0)
+		if b.Missile {
+			tier = 1
+		}
 		s.bodyBuf = append(s.bodyBuf, SnapshotBody{
 			Entity: physics.EntityID(boltEntityBase + b.ID),
 			Kind:   sim.KindBolt,
+			Tier:   sim.Tier(tier),
 			Team:   b.Team,
-			Radius: sim.BoltRadius,
+			Radius: b.Radius(),
 			Health: 1,
 			Pos:    b.Pos,
 			Rot:    physics.LookRotation(b.Vel),
+		})
+	}
+}
+
+// appendPickupBodies puts every cargo box into the snapshot.
+//
+// Boxes have no physics body either — flying into one collects it rather than bouncing off
+// it — so their positions come from the sim's own table. The Tier byte carries which item
+// is inside, which is what lets a client colour a box from a distance.
+func (s *Server) appendPickupBodies() {
+	for e, o := range s.sim.Objects() {
+		if o.Kind != sim.KindPickup {
+			continue
+		}
+		pos, ok := s.sim.PickupPos(e)
+		if !ok {
+			continue
+		}
+		s.bodyBuf = append(s.bodyBuf, SnapshotBody{
+			Entity: e,
+			Kind:   sim.KindPickup,
+			Tier:   o.Tier,
+			Team:   sim.NoTeam,
+			Radius: o.Radius,
+			Health: 1,
+			Pos:    pos,
+			Rot:    physics.Quat{W: 1},
 		})
 	}
 }
@@ -354,12 +388,18 @@ func (s *Server) onConnect(sess *sprocket.Session) {
 func (s *Server) onDisconnect(sess *sprocket.Session) {
 	s.sessions.Add(-1)
 
+	s.engine.Room(roomMatch).Leave(sess)
+
 	if v, ok := sess.Get(sessionKeyPlayer); ok {
 		pid := v.(sim.PlayerID)
-		s.post(func() { s.sim.RemovePlayer(pid) })
+		// Leave the room first, so the roster that goes out afterwards is not also sent
+		// to the socket that just closed. Their seat frees up for the next joiner.
+		s.post(func() {
+			s.sim.RemovePlayer(pid)
+			s.broadcastRoster()
+		})
 	}
 
-	s.engine.Room(roomMatch).Leave(sess)
 	if s.devMode {
 		s.engine.Room(roomDebug).Leave(sess)
 	}
@@ -390,6 +430,77 @@ func (s *Server) onBinary(sess *sprocket.Session, data []byte) {
 		}
 		pid := v.(sim.PlayerID)
 		s.post(func() { s.sim.SetInput(pid, in) })
+
+	case MsgStartMatch:
+		v, ok := sess.Get(sessionKeyPlayer)
+		if !ok {
+			return
+		}
+		pid := v.(sim.PlayerID)
+		// The Sim decides whether this player may start and whether there is a lobby to
+		// start; a non-host pressing it is a no-op rather than an error.
+		s.post(func() {
+			if s.sim.StartMatch(pid) {
+				log.Printf("player %d started the match", pid)
+				s.broadcastRoster()
+			}
+		})
+
+	case MsgSetTeam:
+		v, ok := sess.Get(sessionKeyPlayer)
+		if !ok {
+			return
+		}
+		team, err := DecodeSetTeam(body)
+		if err != nil {
+			return
+		}
+		pid := v.(sim.PlayerID)
+		s.post(func() {
+			// The old crew has to be read before the move, so the session can be taken
+			// out of the right team room — that room is what scopes team chat, and a
+			// player left in their previous one would keep reading their old crew's
+			// messages.
+			from, ok := s.sim.TeamOf(pid)
+			if !ok || !s.sim.SetTeam(pid, team) {
+				return
+			}
+			s.engine.Room(teamRoomName(from)).Leave(sess)
+			s.engine.Room(teamRoomName(team)).Join(sess)
+			s.broadcastRoster()
+			s.sendPlayerState(sess, pid)
+			log.Printf("player %d moved from team %d to %d", pid, from, team)
+		})
+
+	case MsgChat:
+		v, ok := sess.Get(sessionKeyPlayer)
+		if !ok {
+			return
+		}
+		channel, text, err := DecodeChat(body)
+		if err != nil || text == "" {
+			return // an empty message after sanitising is not worth a broadcast
+		}
+		pid := v.(sim.PlayerID)
+		s.post(func() { s.relayChat(pid, channel, text) })
+
+	case MsgUseItem:
+		v, ok := sess.Get(sessionKeyPlayer)
+		if !ok {
+			return
+		}
+		slot, err := DecodeUseItem(body)
+		if err != nil {
+			return
+		}
+		pid := v.(sim.PlayerID)
+		// The Sim decides whether the slot holds anything and whether this player is in
+		// a position to use it; pressing an empty slot is a no-op, not an error.
+		s.post(func() {
+			if s.sim.UseItem(pid, slot) {
+				s.sendPlayerState(sess, pid)
+			}
+		})
 
 	case MsgBuyUpgrade:
 		v, ok := sess.Get(sessionKeyPlayer)
@@ -485,6 +596,14 @@ func (s *Server) handleHello(sess *sprocket.Session, body []byte) {
 	// sent from there once the player actually exists.
 	s.post(func() {
 		p := s.sim.AddPlayer(name, teamPref)
+		if p == nil {
+			// Every crew is full. Closing the socket is the whole rejection: a joiner
+			// with no seat has nothing to draw and no way to become playable, and the
+			// client already reports a connection that closes as a failed join.
+			log.Printf("refused %q: every team is full", name)
+			_ = sess.Close()
+			return
+		}
 		sess.Set(sessionKeyPlayer, p.ID)
 
 		s.engine.Room(teamRoomName(p.Team)).Join(sess)
@@ -493,7 +612,38 @@ func (s *Server) handleHello(sess *sprocket.Session, body []byte) {
 			uint32(p.ID), p.Ship, p.Team, sim.TickHz, sim.TickHz/SnapshotEveryNTicks,
 		))
 		log.Printf("player %d (%s) joined team %d", p.ID, p.Name, p.Team)
+
+		// Everyone's lobby gains a row, including the joiner's own.
+		s.broadcastRoster()
 	})
+}
+
+// relayChat sends a message on to whoever is entitled to read it.
+//
+// The sender's name and team come from the Sim rather than from the message, so a client
+// cannot put words in somebody else's mouth or claim a crew it is not on. Team chat goes
+// to the team room, which is the same room the server already keeps for per-crew traffic.
+func (s *Server) relayChat(pid sim.PlayerID, channel uint8, text string) {
+	p, ok := s.sim.Players()[pid]
+	if !ok {
+		return
+	}
+
+	out := EncodeChatSay(channel, p.Team, p.Name, text)
+	if channel == ChatTeam {
+		s.broadcastBinary(s.engine.Room(teamRoomName(p.Team)), out)
+		return
+	}
+	s.broadcastBinary(s.engine.Room(roomMatch), out)
+}
+
+// broadcastRoster tells every client who is connected. Sent on change rather than on a
+// cadence: joins and leaves are rare, and a lobby that redraws itself fifteen times a
+// second for no reason is worse than one that redraws when something happens.
+func (s *Server) broadcastRoster() {
+	s.broadcastBinary(s.engine.Room(roomMatch), EncodeRoster(
+		s.sim.HostID(), s.sim.TeamCapacity(), s.sim.Roster(),
+	))
 }
 
 func teamRoomName(team uint8) string {
@@ -551,6 +701,14 @@ func (s *Server) publish() {
 	if events := s.sim.DrainEvents(); len(events) > 0 {
 		room := s.engine.Room(roomMatch)
 		for _, e := range events {
+			// The results table goes out just ahead of the event that sets the
+			// end-of-match sequence running, so the screen that sequence leads into is
+			// never waiting on a message that has not arrived. It is sent once, on the
+			// transition — the match is over, and nothing in it can change after this.
+			if e.Type == sim.EventMatchOver {
+				s.broadcastBinary(room, EncodeMatchResults(
+					s.sim.Match().Winner, s.sim.Results()))
+			}
 			s.broadcastBinary(room, EncodeEvent(e))
 		}
 	}
@@ -637,6 +795,7 @@ func (s *Server) broadcastSnapshot(tick uint32) {
 
 	s.appendHillBody()
 	s.appendBoltBodies()
+	s.appendPickupBodies()
 
 	elapsed := uint32(time.Since(s.started).Milliseconds())
 	s.snapBuf = EncodeSnapshot(s.snapBuf, tick, elapsed, s.bodyBuf)

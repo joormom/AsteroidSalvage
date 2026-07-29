@@ -18,6 +18,7 @@ const (
 	PhaseRound        Phase = 1 // scoring
 	PhaseIntermission Phase = 2 // shop is open, field cleared
 	PhaseMatchOver    Phase = 3
+	PhaseLobby        Phase = 4 // held open for players to join; the host starts it
 )
 
 // MatchState is the whole tournament layer.
@@ -42,6 +43,11 @@ type MatchConfig struct {
 	IntermissionSecs int
 	WarmupSeconds    int
 	DisableMatchFlow bool // tests and free-play sandboxes want a single endless round
+
+	// Lobby holds the match in PhaseLobby until the host starts it, instead of running
+	// the warmup clock down into round one. Off by default: a server started from the
+	// command line, or by a playtest, has nobody to press the button.
+	Lobby bool
 
 	// Lives is each team's shared pool of respawns per round. Clamped to
 	// [MinLives, MaxLives] when a round starts — see lives.go.
@@ -93,6 +99,12 @@ func (s *Sim) initMatch() {
 		s.match.RoundWins[id] = 0
 	}
 	s.match.ticksLeft = s.matchCfg.WarmupSeconds * TickHz
+	if s.matchCfg.Lobby {
+		// No clock at all. The lobby ends when the host says so, and a countdown ticking
+		// away underneath a screen you are still filling would only ask why.
+		s.match.Phase = PhaseLobby
+		s.match.ticksLeft = 0
+	}
 	// Filled in before the first round so the HUD has a real number during warmup rather
 	// than showing every crew on zero lives.
 	s.resetLives()
@@ -108,6 +120,10 @@ func (s *Sim) initMatch() {
 // advanceMatch runs the phase machine one tick. Called from Step.
 func (s *Sim) advanceMatch() {
 	if s.matchCfg.DisableMatchFlow || s.match.Phase == PhaseMatchOver {
+		return
+	}
+	// The lobby has no clock. It ends on StartMatch and nothing else.
+	if s.match.Phase == PhaseLobby {
 		return
 	}
 
@@ -126,6 +142,80 @@ func (s *Sim) advanceMatch() {
 	case PhaseIntermission:
 		s.beginRound(s.match.Round + 1)
 	}
+}
+
+// HostID is the pilot allowed to start the match from the lobby; 0 if nobody has
+// connected yet.
+func (s *Sim) HostID() PlayerID { return s.hostID }
+
+// SetTeam moves a player to another crew, reporting whether it happened.
+//
+// **Lobby only.** Switching mid-match would let somebody join whichever crew is winning,
+// and would strand whatever their old crew was counting on them for — their cargo, their
+// share of the life pool, the station upgrades they helped pay for. The lobby is the one
+// moment where a crew has no state to abandon.
+//
+// Refused when the target crew is full, so a switch cannot overrun the seats the lobby
+// draws, and in co-op, where there is only one crew to be on.
+func (s *Sim) SetTeam(id PlayerID, team uint8) bool {
+	if s.match.Phase != PhaseLobby || s.cfg.Coop {
+		return false
+	}
+	p, ok := s.players[id]
+	if !ok || p.Team == team {
+		return false
+	}
+	dst, ok := s.teams[team]
+	if !ok || dst.Members >= s.cfg.TeamSize {
+		return false
+	}
+
+	if src, ok := s.teams[p.Team]; ok {
+		src.Members--
+	}
+	p.Team = team
+	dst.Members++
+
+	// The hull is what everything else reads the owner off — the snapshot's team byte,
+	// who a laser may hit, which station counts as home.
+	if o, ok := s.objects[p.Ship]; ok {
+		o.Team = team
+	}
+	// And move them to the new crew's spawn, or they are sitting outside their old
+	// station wondering why home is on the far side of the map.
+	s.resetShip(p)
+	return true
+}
+
+// TeamOf reports which crew a player is on, and whether they exist at all.
+func (s *Sim) TeamOf(id PlayerID) (uint8, bool) {
+	p, ok := s.players[id]
+	if !ok {
+		return NoTeam, false
+	}
+	return p.Team, true
+}
+
+// StartMatch leaves the lobby and runs the warmup into round one. Reports whether it did
+// anything, so the caller can tell a rejected request from a redundant one.
+//
+// Requests are checked here rather than at the socket: the phase and the host's identity
+// both live in the sim, and a rule enforced in the transport is a rule that a second
+// transport would have to reimplement.
+func (s *Sim) StartMatch(by PlayerID) bool {
+	if s.match.Phase != PhaseLobby || by != s.hostID {
+		return false
+	}
+
+	// Into warmup rather than straight into round one: the warmup is what gives everyone
+	// a few seconds to find their ship before anything is being scored, and skipping it
+	// would make the first round of a lobby match different from every other one.
+	s.match.Phase = PhaseWarmup
+	s.match.ticksLeft = s.matchCfg.WarmupSeconds * TickHz
+	if s.match.ticksLeft <= 0 {
+		s.beginRound(1)
+	}
+	return true
 }
 
 func (s *Sim) beginRound(n int) {
@@ -149,6 +239,12 @@ func (s *Sim) beginRound(n int) {
 	s.wave = 0
 	s.SpawnWave()
 
+	// A fresh scatter of cargo boxes, in new places. Carrying the last round's layout
+	// over would hand whoever memorised it a head start on the only reward you get by
+	// flying rather than fighting.
+	s.clearPickups()
+	s.spawnPickups()
+
 	// Everyone starts empty-handed at a spawn point, so nobody carries an advantage
 	// across the intermission. Anyone grounded by the last round's life pool flies again.
 	for _, p := range s.players {
@@ -156,6 +252,7 @@ func (s *Sim) beginRound(n int) {
 			s.release(p, EventDropped)
 		}
 		p.grounded = false
+		p.ClearItems()
 		s.resetShip(p)
 	}
 

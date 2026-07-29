@@ -29,6 +29,28 @@ func ramInto(s *Sim, a physics.EntityID, b physics.EntityID, speed float32, stan
 	}
 }
 
+// coastInto launches a ship at a target and lets it fly, without re-driving the velocity
+// every tick. That distinction matters for collision damage: holding thrust against a
+// surface is a sustained contact, while a player flying into a rock hits it once and
+// bounces. ramInto models the former, this the latter.
+func coastInto(s *Sim, a physics.EntityID, b physics.EntityID, speed float32,
+	standoff float32) {
+
+	tgt, _ := s.world.GetBody(b)
+	o := s.objects[b]
+
+	start := tgt.Pos.Sub(physics.Vec3{Y: o.Radius + standoff})
+	s.world.SetPosition(a, start)
+	s.world.SetVelocity(a, physics.Vec3{Y: speed})
+
+	for i := 0; i < 120; i++ {
+		s.stepN(1)
+		if pl := s.playerByShip(a); pl != nil && pl.Dead() {
+			return
+		}
+	}
+}
+
 // Two ships meeting at speed must both die. A rammer who walked away would make closing
 // to tractor range suicidal against anyone with a boost tank.
 func TestRammingAnEnemyShipKillsBoth(t *testing.T) {
@@ -120,5 +142,103 @@ func TestRammingYourOwnStationIsHarmless(t *testing.T) {
 
 	if got := s.objects[station].Health; got != before {
 		t.Errorf("own station took %v damage from a docking bump", before-got)
+	}
+}
+
+/*============================================================================
+ * Flying into things
+ *
+ * Distinct from ramming: rocks and scenery are not decided by a threshold, they scale.
+ * Every m/s over HullImpactThreshold costs a hull point, so a scrape is survivable and a
+ * flat-out collision is not.
+ *===========================================================================*/
+
+func TestFlyingIntoARockDamagesTheHullByImpactSpeed(t *testing.T) {
+	s := newBareSim(t, nil)
+	p := s.AddPlayer("pilot", 0)
+
+	s.world.SetPosition(p.Ship, physics.Vec3{X: 0, Y: 0, Z: 400})
+	s.world.SetVelocity(p.Ship, physics.Vec3{})
+	s.stepN(1)
+
+	// A big, heavy rock so it does not simply get shoved aside.
+	rock := s.addRock(physics.Vec3{X: 0, Y: 120, Z: 400}, 4000, 12, 100)
+	s.world.SetVelocity(rock, physics.Vec3{})
+	s.stepN(1)
+
+	const speed = 24.0 // 12 over the threshold, so about 12 damage of a 30-point hull
+	full := s.objects[p.Ship].Health
+	coastInto(s, p.Ship, rock, speed, 20)
+
+	got := full - s.objects[p.Ship].Health
+	if got <= 0 {
+		t.Fatalf("a %.0f m/s collision with a rock did no damage", speed)
+	}
+	if p.Dead() {
+		t.Fatalf("a %.0f m/s collision destroyed the ship; it should be survivable", speed)
+	}
+	// Generous bounds: the exact closing speed at contact depends on damping and on how
+	// far the rock gives. The point is that it scales, not that it is to the decimal.
+	if got < 4 || got > 26 {
+		t.Errorf("took %.1f damage at %.0f m/s, want something proportionate", got, speed)
+	}
+}
+
+func TestDriftingIntoARockIsHarmless(t *testing.T) {
+	s := newBareSim(t, nil)
+	p := s.AddPlayer("pilot", 0)
+
+	s.world.SetPosition(p.Ship, physics.Vec3{X: 0, Y: 0, Z: 400})
+	s.world.SetVelocity(p.Ship, physics.Vec3{})
+	s.stepN(1)
+
+	rock := s.addRock(physics.Vec3{X: 0, Y: 120, Z: 400}, 4000, 12, 100)
+	s.world.SetVelocity(rock, physics.Vec3{})
+	s.stepN(1)
+
+	full := s.objects[p.Ship].Health
+	coastInto(s, p.Ship, rock, HullImpactThreshold*0.5, 12)
+
+	if got := full - s.objects[p.Ship].Health; got != 0 {
+		t.Errorf("nudging a rock at half the threshold cost %.1f hull", got)
+	}
+}
+
+// Full speed into anything solid is death — the ceiling the scale was chosen to put there.
+func TestFullSpeedIntoARockIsFatal(t *testing.T) {
+	s := newBareSim(t, nil)
+	p := s.AddPlayer("pilot", 0)
+
+	s.world.SetPosition(p.Ship, physics.Vec3{X: 0, Y: 0, Z: 400})
+	s.world.SetVelocity(p.Ship, physics.Vec3{})
+	s.stepN(1)
+
+	rock := s.addRock(physics.Vec3{X: 0, Y: 300, Z: 400}, 8000, 16, 100)
+	s.world.SetVelocity(rock, physics.Vec3{})
+	s.stepN(1)
+
+	// Comfortably past ShipMaxHealth/HullImpactScale + HullImpactThreshold.
+	coastInto(s, p.Ship, rock, 60, 40)
+
+	if !p.Dead() {
+		t.Errorf("a 60 m/s collision left the pilot alive on %.1f health",
+			s.objects[p.Ship].Health)
+	}
+}
+
+// The shield is a shield: it eats collision damage too, not only weapon fire.
+func TestTheShieldAbsorbsCollisionDamage(t *testing.T) {
+	s := newBareSim(t, nil)
+	p := s.AddPlayer("pilot", 0)
+	p.Effects.Shield = ShieldPool
+
+	full := s.objects[p.Ship].Health
+	s.damageHull(p, 20)
+
+	if got := s.objects[p.Ship].Health; got != full {
+		t.Errorf("hull dropped to %.1f through a full shield", got)
+	}
+	if p.Effects.Shield != ShieldPool-20 {
+		t.Errorf("shield is on %.1f, want %.1f", p.Effects.Shield, ShieldPool-20)
 	}
 }

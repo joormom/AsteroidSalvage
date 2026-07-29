@@ -46,12 +46,19 @@ class NetClient:
         # Shots are pure VFX with a lifetime of a few frames, so a backlog is worse than
         # a drop — an old beam drawn late points at nothing.
         self._shots: queue.Queue[proto.Shot] = queue.Queue(maxsize=128)
+        self._chat: queue.Queue[proto.ChatSay] = queue.Queue(maxsize=64)
 
         self._welcome: proto.Welcome | None = None
         self._teams: list[proto.TeamState] = []
         self._match: proto.MatchState | None = None
         self._player: proto.PlayerState | None = None
         self._offers: list[proto.ShopOffer] = []
+        # Sent once, on the transition to match over, and then never again — so it is
+        # held rather than queued: the screen that reads it opens seven seconds later.
+        self._results: proto.MatchResults | None = None
+        # Who is connected. Pushed on join and leave rather than on a cadence, so it is
+        # None until the server has said something rather than empty.
+        self._roster: proto.Roster | None = None
         self._state_lock = threading.Lock()
 
         self.connected = threading.Event()
@@ -173,6 +180,24 @@ class NetClient:
             with self._state_lock:
                 self._offers = proto.decode_shop_offers(body)
 
+        elif tag == proto.MSG_CHAT_SAY:
+            # Queued rather than held: chat is a stream of discrete lines, and dropping
+            # the oldest when a flood arrives is better than blocking the socket thread.
+            if self._chat.full():
+                try:
+                    self._chat.get_nowait()
+                except queue.Empty:
+                    pass
+            self._chat.put_nowait(proto.decode_chat_say(body))
+
+        elif tag == proto.MSG_ROSTER:
+            with self._state_lock:
+                self._roster = proto.decode_roster(body)
+
+        elif tag == proto.MSG_MATCH_RESULTS:
+            with self._state_lock:
+                self._results = proto.decode_match_results(body)
+
         elif tag == proto.MSG_SHOTS:
             for shot in proto.decode_shots(body):
                 if self._shots.full():
@@ -208,6 +233,20 @@ class NetClient:
     def offers(self) -> list[proto.ShopOffer]:
         with self._state_lock:
             return list(self._offers)
+
+    @property
+    def results(self) -> proto.MatchResults | None:
+        with self._state_lock:
+            return self._results
+
+    @property
+    def roster(self) -> proto.Roster | None:
+        with self._state_lock:
+            return self._roster
+
+    def start_match(self) -> None:
+        """Leave the lobby. The server ignores this from anyone but the host."""
+        self._send(proto.encode_start_match())
 
     def _send(self, payload: bytes) -> None:
         conn = self._conn
@@ -256,6 +295,27 @@ class NetClient:
                 out.append(self._shots.get_nowait())
             except queue.Empty:
                 return out
+
+    def take_chat(self) -> list[proto.ChatSay]:
+        out = []
+        while True:
+            try:
+                out.append(self._chat.get_nowait())
+            except queue.Empty:
+                return out
+
+    def say(self, channel: int, text: str) -> None:
+        """Send a chat line. The server decides who sees it."""
+        if text.strip():
+            self._send(proto.encode_chat(channel, text))
+
+    def set_team(self, team: int) -> None:
+        """Ask to move crew. The server refuses outside the lobby, or if it is full."""
+        self._send(proto.encode_set_team(team))
+
+    def use_item(self, slot: int) -> None:
+        """Spend an inventory slot. Ignored by the server if it is empty."""
+        self._send(proto.encode_use_item(slot))
 
     def send_input(self, **kwargs) -> None:
         """Send one input frame. Silently drops if the socket is down."""

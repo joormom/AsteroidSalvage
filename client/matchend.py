@@ -73,6 +73,10 @@ class MatchEndSequence:
         self._losers: list[int] = []
         self._won = False
 
+        # finished distinguishes "played all the way through" from "never started",
+        # which `active` alone cannot: both are False. The results screen waits on it.
+        self.finished = False
+
     # --- control -----------------------------------------------------------
 
     def start(self, winner: int, own_team: int, teams) -> None:
@@ -94,9 +98,19 @@ class MatchEndSequence:
         self._t = 0.0
         self._next_secondary = 0.0
         self._blown = False
+        self.finished = False
 
     def stop(self) -> None:
         self.active = False
+        self.finished = False
+        self.clear_banner()
+
+    def clear_banner(self) -> None:
+        """Take the letters down without ending the sequence.
+
+        The results screen calls this as it opens: the banner used to stay up because
+        there was nothing behind it to look at, and now there is a table there.
+        """
         self.banner.hide()
         self.subtitle.hide()
 
@@ -116,9 +130,10 @@ class MatchEndSequence:
             self._letters()
 
         if self._t >= SEQUENCE_END:
-            # The banner stays up — the match is over and there is nothing behind it to
-            # look at — but the sequence stops doing work.
+            # The banner stays up until the results screen takes over, but the sequence
+            # stops doing work here.
             self.active = False
+            self.finished = True
 
     def _charge(self) -> None:
         """Small detonations rippling across the doomed hulls."""

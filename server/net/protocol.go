@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"strings"
 
 	"asteroidsalvage/physics"
 	"asteroidsalvage/sim"
@@ -21,17 +22,24 @@ const (
 	MsgBuyOffer     byte = 0x04
 	MsgSetTeamName  byte = 0x05
 	MsgSetTeamColor byte = 0x06
+	MsgStartMatch   byte = 0x07
+	MsgUseItem      byte = 0x08
+	MsgChat         byte = 0x09
+	MsgSetTeam      byte = 0x0A
 	MsgDebugSet     byte = 0x10
 
-	MsgWelcome     byte = 0x80
-	MsgSnapshot    byte = 0x81
-	MsgEvent       byte = 0x82
-	MsgTeamState   byte = 0x83
-	MsgMatchState  byte = 0x84
-	MsgPlayerState byte = 0x85
-	MsgShopOffers  byte = 0x86
-	MsgShots       byte = 0x87
-	MsgDebugStats  byte = 0x90
+	MsgWelcome      byte = 0x80
+	MsgSnapshot     byte = 0x81
+	MsgEvent        byte = 0x82
+	MsgTeamState    byte = 0x83
+	MsgMatchState   byte = 0x84
+	MsgPlayerState  byte = 0x85
+	MsgShopOffers   byte = 0x86
+	MsgShots        byte = 0x87
+	MsgMatchResults byte = 0x88
+	MsgRoster       byte = 0x89
+	MsgChatSay      byte = 0x8A
+	MsgDebugStats   byte = 0x90
 )
 
 // Input flag bits.
@@ -381,6 +389,226 @@ func EncodeTeamState(teams []sim.Team) []byte {
 	return b
 }
 
+// EncodeMatchResults builds a 0x88 MatchResults — the end-of-match table.
+//
+// This is the one message that broadcasts everybody's credits. During a match that would
+// leak what a rival can afford in the shop, which is why PlayerState is sent per session;
+// once the match is over there is no shop left to open and nothing to be gained from
+// hiding it, and a results screen that could not show earnings would be missing the
+// number players most want to compare.
+//
+// Rows arrive pre-sorted (see sim.Results) so every client draws the same table.
+func EncodeMatchResults(winner uint8, rows []sim.PlayerResult) []byte {
+	if len(rows) > 255 {
+		rows = rows[:255]
+	}
+
+	b := make([]byte, 0, 3+len(rows)*32)
+	b = append(b, MsgMatchResults, winner, byte(len(rows)))
+	for _, r := range rows {
+		b = putU32(b, uint32(r.ID))
+		b = append(b, r.Team)
+
+		name := []byte(r.Name)
+		if len(name) > 20 {
+			name = name[:20]
+		}
+		b = append(b, byte(len(name)))
+		b = append(b, name...)
+
+		// Counts are u16 rather than u8: a long co-op match can run past 255 deliveries,
+		// and a stat that silently wraps is worse than one that costs a byte.
+		b = putU16(b, clampU16(r.Stats.Delivered))
+		b = putF32(b, r.Stats.Banked)
+		b = putU16(b, clampU16(r.Stats.Kills))
+		b = putU16(b, clampU16(r.Stats.Deaths))
+		b = putF32(b, r.Credits)
+	}
+	return b
+}
+
+func clampU16(v int) uint16 {
+	if v < 0 {
+		return 0
+	}
+	if v > 0xFFFF {
+		return 0xFFFF
+	}
+	return uint16(v)
+}
+
+// EncodeRoster builds a 0x89 Roster — who is connected, and how many seats a crew has.
+//
+// Names are here rather than in TeamState because TeamState is a per-crew record and this
+// is a per-player one; before the lobby existed, no message carried another player's name
+// at all, which is why the client could count opponents but never name them.
+func EncodeRoster(hostID sim.PlayerID, capacity int, rows []sim.RosterEntry) []byte {
+	if len(rows) > 255 {
+		rows = rows[:255]
+	}
+	if capacity < 0 {
+		capacity = 0
+	}
+	if capacity > 255 {
+		capacity = 255
+	}
+
+	b := make([]byte, 0, 6+len(rows)*12)
+	b = append(b, MsgRoster)
+	b = putU32(b, uint32(hostID))
+	b = append(b, byte(capacity), byte(len(rows)))
+	for _, r := range rows {
+		b = putU32(b, uint32(r.ID))
+		b = append(b, r.Team)
+
+		name := []byte(r.Name)
+		if len(name) > 20 {
+			name = name[:20]
+		}
+		b = append(b, byte(len(name)))
+		b = append(b, name...)
+	}
+	return b
+}
+
+// DecodeRoster parses a 0x89 body.
+func DecodeRoster(b []byte) (sim.PlayerID, int, []sim.RosterEntry, error) {
+	if len(b) < 6 {
+		return 0, 0, nil, errShort
+	}
+	hostID := sim.PlayerID(getU32(b))
+	capacity := int(b[4])
+	n := int(b[5])
+
+	rows := make([]sim.RosterEntry, 0, n)
+	off := 6
+	for i := 0; i < n; i++ {
+		if len(b) < off+6 {
+			return 0, 0, nil, errShort
+		}
+		r := sim.RosterEntry{ID: sim.PlayerID(getU32(b[off:])), Team: b[off+4]}
+		nameLen := int(b[off+5])
+		off += 6
+		if len(b) < off+nameLen {
+			return 0, 0, nil, errShort
+		}
+		r.Name = string(b[off : off+nameLen])
+		off += nameLen
+		rows = append(rows, r)
+	}
+	return hostID, capacity, rows, nil
+}
+
+// EncodeStartMatch builds a 0x07 StartMatch. The server ignores it from anyone but the
+// host, and outside the lobby.
+func EncodeStartMatch() []byte { return []byte{MsgStartMatch} }
+
+// Chat channels. Wire values.
+const (
+	ChatAll  uint8 = 0
+	ChatTeam uint8 = 1
+)
+
+// ChatMaxBytes caps a message. Long enough for a sentence, short enough that it cannot be
+// used to flood other clients' screens.
+const ChatMaxBytes = 120
+
+// EncodeChat builds a 0x09 Chat — what a player typed.
+func EncodeChat(channel uint8, text string) []byte {
+	raw := []byte(text)
+	if len(raw) > ChatMaxBytes {
+		raw = raw[:ChatMaxBytes]
+	}
+	return append([]byte{MsgChat, channel, byte(len(raw))}, raw...)
+}
+
+// DecodeChat parses a 0x09 body. The text is sanitised here rather than at the sender,
+// because the sender is not ours to trust.
+func DecodeChat(b []byte) (uint8, string, error) {
+	if len(b) < 2 {
+		return 0, "", errShort
+	}
+	channel := b[0]
+	n := int(b[1])
+	if n > ChatMaxBytes || len(b) < 2+n {
+		return 0, "", errShort
+	}
+	return channel, sanitizeChat(string(b[2 : 2+n])), nil
+}
+
+// sanitizeChat strips control characters so a message cannot inject escape sequences into
+// another player's terminal or smuggle newlines into their chat log.
+func sanitizeChat(s string) string {
+	out := make([]rune, 0, len(s))
+	for _, r := range s {
+		if r >= 0x20 && r != 0x7F {
+			out = append(out, r)
+		}
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// EncodeChatSay builds a 0x8A ChatSay — a message on its way out to clients.
+func EncodeChatSay(channel, team uint8, name, text string) []byte {
+	nb := []byte(name)
+	if len(nb) > 20 {
+		nb = nb[:20]
+	}
+	tb := []byte(text)
+	if len(tb) > ChatMaxBytes {
+		tb = tb[:ChatMaxBytes]
+	}
+
+	b := make([]byte, 0, 5+len(nb)+len(tb))
+	b = append(b, MsgChatSay, channel, team, byte(len(nb)))
+	b = append(b, nb...)
+	b = append(b, byte(len(tb)))
+	return append(b, tb...)
+}
+
+// DecodeChatSay parses a 0x8A body.
+func DecodeChatSay(b []byte) (channel, team uint8, name, text string, err error) {
+	if len(b) < 3 {
+		return 0, 0, "", "", errShort
+	}
+	channel, team = b[0], b[1]
+	n := int(b[2])
+	if len(b) < 3+n+1 {
+		return 0, 0, "", "", errShort
+	}
+	name = string(b[3 : 3+n])
+
+	off := 3 + n
+	t := int(b[off])
+	off++
+	if len(b) < off+t {
+		return 0, 0, "", "", errShort
+	}
+	return channel, team, name, string(b[off : off+t]), nil
+}
+
+// EncodeSetTeam builds a 0x0A SetTeam — move to another crew from the lobby.
+func EncodeSetTeam(team uint8) []byte { return []byte{MsgSetTeam, team} }
+
+// DecodeSetTeam parses a 0x0A body.
+func DecodeSetTeam(b []byte) (uint8, error) {
+	if len(b) < 1 {
+		return 0, errShort
+	}
+	return b[0], nil
+}
+
+// EncodeUseItem builds a 0x08 UseItem — spend whatever is in this inventory slot.
+func EncodeUseItem(slot int) []byte { return []byte{MsgUseItem, byte(slot)} }
+
+// DecodeUseItem parses a 0x08 body.
+func DecodeUseItem(b []byte) (int, error) {
+	if len(b) < 1 {
+		return 0, errShort
+	}
+	return int(b[0]), nil
+}
+
 // EncodeShopOffers builds a 0x86 ShopOffers — this intermission's randomised choices.
 func EncodeShopOffers(offers []sim.Offer) []byte {
 	b := make([]byte, 0, 2+len(offers)*6)
@@ -545,6 +773,10 @@ type PlayerState struct {
 
 	// Grounded means the team's life pool ran out and there is no respawn coming.
 	Grounded bool
+
+	// Items carried, and the effects running. See sim/items.go.
+	Items   [sim.ItemSlots]sim.ItemID
+	Effects sim.Effects
 }
 
 // EncodePlayerState builds a 0x85 PlayerState.
@@ -575,6 +807,17 @@ func EncodePlayerState(p *sim.Player, health float32) []byte {
 		grounded = 1
 	}
 	b = append(b, grounded)
+
+	// Inventory and item effects, appended rather than given their own message: they are
+	// personal exactly like credits and charge are, and they change at the same rate the
+	// bars do. A separate 0x8B would be a second per-session message on the same cadence
+	// carrying the same player's state.
+	for _, item := range p.Items {
+		b = append(b, byte(item))
+	}
+	b = putF32(b, p.Effects.Damage)
+	b = putF32(b, p.Effects.Speed)
+	b = putF32(b, p.Effects.Shield)
 	return b
 }
 
@@ -610,6 +853,16 @@ func DecodePlayerState(b []byte) (PlayerState, error) {
 	}
 	if len(b) >= off+29 {
 		ps.Grounded = b[off+28] != 0
+	}
+	if len(b) >= off+29+sim.ItemSlots+12 {
+		o := off + 29
+		for i := 0; i < sim.ItemSlots; i++ {
+			ps.Items[i] = sim.ItemID(b[o+i])
+		}
+		o += sim.ItemSlots
+		ps.Effects.Damage = getF32(b[o:])
+		ps.Effects.Speed = getF32(b[o+4:])
+		ps.Effects.Shield = getF32(b[o+8:])
 	}
 	return ps, nil
 }
@@ -797,6 +1050,55 @@ func DecodeTeamState(b []byte) ([]sim.Team, error) {
 		teams = append(teams, t)
 	}
 	return teams, nil
+}
+
+// MatchResults is the decoded 0x88.
+type MatchResults struct {
+	Winner  uint8 // team id, 0xFF on a draw
+	Players []sim.PlayerResult
+}
+
+// DecodeMatchResults parses a 0x88 body.
+func DecodeMatchResults(b []byte) (MatchResults, error) {
+	if len(b) < 2 {
+		return MatchResults{}, errShort
+	}
+	out := MatchResults{Winner: b[0]}
+	n := int(b[1])
+
+	out.Players = make([]sim.PlayerResult, 0, n)
+	off := 2
+	for i := 0; i < n; i++ {
+		if len(b) < off+6 {
+			return MatchResults{}, errShort
+		}
+		r := sim.PlayerResult{
+			ID:   sim.PlayerID(getU32(b[off:])),
+			Team: b[off+4],
+		}
+		nameLen := int(b[off+5])
+		off += 6
+		if len(b) < off+nameLen {
+			return MatchResults{}, errShort
+		}
+		r.Name = string(b[off : off+nameLen])
+		off += nameLen
+
+		if len(b) < off+14 {
+			return MatchResults{}, errShort
+		}
+		r.Stats = sim.PlayerStats{
+			Delivered: int(getU16(b[off:])),
+			Banked:    getF32(b[off+2:]),
+			Kills:     int(getU16(b[off+6:])),
+			Deaths:    int(getU16(b[off+8:])),
+		}
+		r.Credits = getF32(b[off+10:])
+		off += 14
+
+		out.Players = append(out.Players, r)
+	}
+	return out, nil
 }
 
 // DebugStats is the decoded 0x90.

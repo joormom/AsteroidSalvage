@@ -8,14 +8,19 @@ import "asteroidsalvage/physics"
 // a line. That made the weapon a pointing contest — if your crosshair was on someone when
 // you clicked, you hit them, at any range.
 //
-// Bolts travel now, and they fall. Two consequences, and both are the point:
+// Bolts travel, and they fly straight. Travel time is the whole mechanic: you have to
+// lead a moving target, and a ship crossing at 40 m/s is most of its own length away by
+// the time a bolt covers 300 m — so range costs accuracy in a way a damage falloff never
+// conveys.
 //
-//   - You have to lead a moving target. A ship crossing at 40 m/s is most of its own
-//     length away by the time a bolt crosses 300 m, so range costs accuracy in a way a
-//     damage falloff never conveys.
-//   - You have to aim high at distance. The drop is not physics — there is no gravity out
-//     here — it is a deliberate arc that turns a long shot into a judgement rather than a
-//     straight line, and it gives the reticle something to be wrong about.
+// They used to arc downward as well, a deliberate 22 m/s² along world -Z. That is gone:
+// a shot now goes exactly where it is pointed, and the only correction a player makes is
+// for the target's motion. There is no gravity out here, and a reticle that is wrong
+// about elevation turns every long shot into a guess at how much to hold over rather than
+// a read of where somebody is going.
+//
+// What replaces the arc as a limit on range is a hard one: a round is spent after
+// BoltMaxRange and simply stops existing.
 //
 // The server owns the flight. Bolts are not physics bodies: they are swept segments tested
 // against the same objects the old raycast used, which keeps them cheap and keeps them from
@@ -27,18 +32,14 @@ const (
 	// instant across the belt.
 	BoltSpeed = 420.0
 
-	// BoltDrop is the downward acceleration applied to a bolt, in m/s². Along world -Z,
-	// which is the plane the stations and the belt sit in, so "down" means the same thing
-	// to everyone regardless of which way their ship is rolled.
+	// BoltMaxRange is how far a round travels before it is spent, in metres. Measured as
+	// distance actually flown rather than as a lifetime in ticks, so a round fired from a
+	// ship already moving fast — muzzle velocity is added to the hull's — does not quietly
+	// reach further than one fired from a standstill.
 	//
-	// At 420 m/s a 300 m shot is in the air 0.71 s and falls about 5.5 m — enough that
-	// you notice and compensate at range, little enough that ordinary mid-range fighting
-	// is still pointing rather than lobbing.
-	BoltDrop = 22.0
-
-	// BoltLifetimeTicks caps a bolt's flight. At BoltSpeed this is well past the far side
-	// of the map, so it only ever matters for shots fired into open space.
-	BoltLifetimeTicks = TickHz * 5
+	// 2000 m is a little under a fifth of the map's diameter and comfortably past any
+	// range a fight happens at, so in practice it bounds shots fired into open space.
+	BoltMaxRange = 2000.0
 
 	// BoltRadius is the bolt's own size for collision, in metres. Small but not zero:
 	// a purely infinitesimal point makes glancing hits on a fast crosser feel stolen.
@@ -56,7 +57,26 @@ type Bolt struct {
 	Ship    physics.EntityID // the hull it came from, so it cannot hit its own nose
 	Damage  float32
 
-	ticks int
+	// Missile marks the one-shot item round rather than a laser bolt. It flies through
+	// the same code with different numbers; the flag changes how it is drawn, how big it
+	// is, and that it steers. See items.go.
+	Missile bool
+
+	// Target is the ship a missile is chasing, locked at launch. 0 means it never
+	// acquired one, or the one it had is gone — either way it carries straight on.
+	Target physics.EntityID
+
+	// travelled is metres flown so far, against BoltMaxRange.
+	travelled float32
+}
+
+// Radius is the round's collision size. A missile is fatter than a bolt: it is a rare
+// shot, and losing one to a hitbox technicality reads as the game cheating.
+func (b *Bolt) Radius() float32 {
+	if b.Missile {
+		return MissileRadius
+	}
+	return BoltRadius
 }
 
 // Bolts returns every round currently in flight, for the snapshot encoder.
@@ -82,7 +102,6 @@ func (s *Sim) fireBolt(p *Player) {
 		Shooter: p.ID,
 		Ship:    p.Ship,
 		Damage:  p.LaserDamageDealt(),
-		ticks:   BoltLifetimeTicks,
 	})
 }
 
@@ -96,22 +115,30 @@ func (s *Sim) updateBolts() {
 	for i := range s.bolts {
 		b := &s.bolts[i]
 
-		b.ticks--
-		if b.ticks <= 0 {
-			continue
+		// Steer before stepping, so the tick that turns is also the tick that travels
+		// along the new heading — a missile that turned only after moving would trail
+		// its own course by one tick, which at 240 m/s is 8 m of lag.
+		if b.Missile {
+			s.steerMissile(b)
 		}
 
-		// Drop, then step. Applying the acceleration first makes the arc consistent with
-		// the client's, which integrates the same way.
-		b.Vel.Z -= BoltDrop * TickDuration
 		from := b.Pos
-		to := from.Add(b.Vel.Scale(TickDuration))
+		step := b.Vel.Scale(TickDuration)
+		to := from.Add(step)
+
+		// Range is checked against the step that is about to happen, so a round is spent
+		// at the limit rather than one tick past it — at 420 m/s a tick is 14 m, which is
+		// wider than most things in the game.
+		if b.travelled+step.Len() >= BoltMaxRange {
+			continue
+		}
 
 		if hit, point := s.boltSweep(b, from, to); hit != 0 {
 			s.resolveBoltHit(b, hit, point)
 			continue // spent
 		}
 
+		b.travelled += step.Len()
 		b.Pos = to
 		live = append(live, *b)
 	}
@@ -158,7 +185,7 @@ func (s *Sim) boltSweep(b *Bolt, from, to physics.Vec3) (physics.EntityID, physi
 		if !ok {
 			continue
 		}
-		if t, hit := raySphere(from, dir, st.Pos, o.Radius+BoltRadius); hit && t <= bestT {
+		if t, hit := raySphere(from, dir, st.Pos, o.Radius+b.Radius()); hit && t <= bestT {
 			best, bestT = e, t
 		}
 	}
@@ -199,26 +226,26 @@ func (s *Sim) applyStationDamage(b *Bolt, o *Object) {
 	if victim == nil {
 		return
 	}
-	o.Health -= b.Damage
+	o.Health -= victim.absorbWithShield(b.Damage)
 	s.emit(Event{Type: EventShipHit, Entity: o.Entity, Value: b.Damage})
 	if o.Health <= 0 {
 		s.destroyShipByStation(victim, b.Team)
 	}
 }
 
-// AimBolt returns the direction to fire so a round arrives where a moving target will be,
-// compensating for both the target's motion and the bolt's own drop.
+// AimBolt returns the direction to fire so a round arrives where a moving target will be.
+//
+// Lead only. It used to solve elevation as well, back when rounds arced; with a flat
+// trajectory the whole problem is "where will they be when it gets there".
 //
 // Solved by iteration rather than algebraically: flight time depends on the lead point and
-// the lead point depends on the flight time. Two passes is plenty at these speeds, and it
+// the lead point depends on the flight time. Three passes is plenty at these speeds, and it
 // keeps a closed-form quartic out of the codebase for a gun that is allowed to miss.
 func AimBolt(from, targetPos, targetVel physics.Vec3) physics.Vec3 {
 	aim := targetPos
 	for i := 0; i < 3; i++ {
 		t := aim.Sub(from).Len() / BoltSpeed
-		// Where it will be, raised by however far the round will fall getting there.
 		aim = targetPos.Add(targetVel.Scale(t))
-		aim.Z += 0.5 * BoltDrop * t * t
 	}
 	d := aim.Sub(from)
 	if l := d.Len(); l > 1e-6 {
@@ -239,7 +266,6 @@ func (s *Sim) fireStationBolt(team uint8, station physics.EntityID, from physics
 		Team:   team,
 		Ship:   station, // so a round cannot clip the hull it left
 		Damage: damage,
-		ticks:  BoltLifetimeTicks,
 	})
 }
 
@@ -255,7 +281,11 @@ func (s *Sim) applyDamageAt(shooter *Player, o *Object, damage float32) {
 		if victim == nil {
 			return
 		}
-		o.Health -= damage
+		// The item shield eats what it can first. A hit it absorbs entirely still emits
+		// the event, so the shooter sees they connected and the victim can be shown the
+		// shield taking it rather than nothing happening at all.
+		through := victim.absorbWithShield(damage)
+		o.Health -= through
 		s.emit(Event{Type: EventShipHit, Entity: o.Entity, Player: shooter.ID, Value: damage})
 		if o.Health <= 0 {
 			s.destroyShip(victim, shooter)

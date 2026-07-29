@@ -136,7 +136,13 @@ func CostFor(u UpgradeID, have int) (float32, bool) {
 
 // ThrustMultiplier is the engine scaling from upgrades.
 func (p *Player) ThrustMultiplier() float32 {
-	return 1.0 + 0.25*float32(p.Upgrades[UpgradeThrust])
+	m := 1.0 + 0.25*float32(p.Upgrades[UpgradeThrust])
+	// The speed item multiplies on top of the engine upgrade rather than replacing it,
+	// so it is worth the same proportion to everyone who picks it up.
+	if p.Effects.Speed > 0 {
+		m *= BoostScale
+	}
+	return m
 }
 
 // GrabRangeBonus is extra tractor reach in metres.

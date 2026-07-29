@@ -235,3 +235,123 @@ def make_icon(upgrade_id: int) -> NodePath:
     """Build the icon for an upgrade. Unknown ids get a neutral placeholder rather than
     raising, so a client talking to a newer server still renders a usable shop."""
     return _BUILDERS.get(upgrade_id, _unknown_icon)()
+
+
+def _missile_icon(c: Vec4) -> NodePath:
+    """A rocket: pointed nose, body, tail fins, exhaust."""
+    ls = _segs(c)
+    ls.moveTo(0, 0, 0.85)          # nose
+    ls.drawTo(0.30, 0, 0.25)
+    ls.drawTo(0.30, 0, -0.45)
+    ls.drawTo(-0.30, 0, -0.45)
+    ls.drawTo(-0.30, 0, 0.25)
+    ls.drawTo(0, 0, 0.85)
+
+    for side in (-1, 1):           # fins
+        ls.moveTo(side * 0.30, 0, -0.15)
+        ls.drawTo(side * 0.66, 0, -0.62)
+        ls.drawTo(side * 0.30, 0, -0.45)
+
+    ls.moveTo(-0.14, 0, -0.62)     # exhaust
+    ls.drawTo(0, 0, -0.90)
+    ls.drawTo(0.14, 0, -0.62)
+    return NodePath(ls.create())
+
+
+def _overcharge_icon(c: Vec4) -> NodePath:
+    """A beam striking a burst — damage, rather than the lightning the boost bar uses."""
+    ls = _segs(c)
+    ls.moveTo(-0.85, 0, -0.55)     # the beam
+    ls.drawTo(0.15, 0, 0.15)
+
+    # An impact star at the far end, so it reads as a hit rather than as an arrow.
+    for a in range(8):
+        ang = math.tau * a / 8
+        ls.moveTo(0.30, 0, 0.30)
+        ls.drawTo(0.30 + math.cos(ang) * 0.42, 0, 0.30 + math.sin(ang) * 0.42)
+    return NodePath(ls.create())
+
+
+def _afterburner_icon(c: Vec4) -> NodePath:
+    """Three stacked chevrons: speed, in the shape every game already uses for it."""
+    ls = _segs(c)
+    for i, y in enumerate((-0.55, -0.05, 0.45)):
+        # Widening upward, so the stack has a direction rather than being a texture.
+        w = 0.40 + i * 0.12
+        ls.moveTo(-w, 0, y)
+        ls.drawTo(0, 0, y + 0.38)
+        ls.drawTo(w, 0, y)
+    return NodePath(ls.create())
+
+
+def _shield_icon(c: Vec4) -> NodePath:
+    """A heater shield: flat top, shoulders, tapering to a point."""
+    ls = _segs(c)
+    ls.moveTo(-0.62, 0, 0.68)
+    ls.drawTo(0.62, 0, 0.68)
+    ls.drawTo(0.62, 0, 0.10)
+    # Curved sides down to the tip, rather than straight lines, so it reads as a shield
+    # and not as a house.
+    steps = 8
+    for i in range(steps + 1):
+        t = i / steps
+        ls.drawTo(0.62 * (1 - t) ** 0.65, 0, 0.10 - 0.78 * t)
+    for i in range(steps + 1):
+        t = i / steps
+        ls.drawTo(-0.62 * t ** 0.65, 0, -0.68 + 0.78 * t)
+    ls.drawTo(-0.62, 0, 0.68)
+    return NodePath(ls.create())
+
+
+_ITEM_BUILDERS = {
+    proto.ITEM_MISSILE: _missile_icon,
+    proto.ITEM_DAMAGE: _overcharge_icon,
+    proto.ITEM_SPEED: _afterburner_icon,
+    proto.ITEM_SHIELD: _shield_icon,
+}
+
+
+def make_item_icon(item_id: int, color=None) -> NodePath | None:
+    """Build a hotbar icon for an item, or None for an empty slot.
+
+    Drawn rather than written. "SHD" in a box is something you have to read and then
+    translate; a shield is something you recognise, which is the whole difference at the
+    moment you are deciding whether to press it.
+    """
+    build = _ITEM_BUILDERS.get(item_id)
+    if build is None:
+        return None
+    rgb = color or proto.ITEM_COLORS.get(item_id, (1, 1, 1))
+    return build(Vec4(rgb[0], rgb[1], rgb[2], 1.0))
+
+
+def make_crown(color=(1.0, 0.82, 0.30, 1.0)) -> NodePath:
+    """The marker beside the host's name in the lobby.
+
+    Drawn rather than typed. A unicode crown would be at the mercy of whatever glyphs
+    Panda3D's default font happens to carry, and a missing glyph renders as a blank or a
+    box — which beside somebody's name reads as a rendering fault rather than a badge.
+    """
+    ls = _segs(Vec4(*color))
+
+    # Outline: a band, three peaks, and the valleys between them.
+    ls.moveTo(-0.80, 0, -0.55)
+    for x, y in (
+        (0.80, -0.55),
+        (0.80, 0.25),
+        (0.42, -0.08),
+        (0.00, 0.48),
+        (-0.42, -0.08),
+        (-0.80, 0.25),
+        (-0.80, -0.55),
+    ):
+        ls.drawTo(x, 0, y)
+
+    # The band, so the base reads as a rim rather than as part of the points.
+    ls.moveTo(-0.80, 0, -0.22)
+    ls.drawTo(0.80, 0, -0.22)
+
+    for cx, cy in ((-0.80, 0.25), (0.00, 0.48), (0.80, 0.25)):
+        _circle(ls, cx, cy, 0.13, steps=10)
+
+    return NodePath(ls.create())

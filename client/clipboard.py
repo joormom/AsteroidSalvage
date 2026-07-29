@@ -12,9 +12,41 @@ from __future__ import annotations
 
 import ctypes
 import sys
+from ctypes import c_size_t, c_uint, c_void_p
 
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
+
+_bound = False
+
+
+def _bind(user32, kernel32) -> None:
+    """Declare the handle-returning calls as pointer-width.
+
+    ctypes assumes a C `int` return for anything it is not told about, so on 64-bit
+    Windows the HANDLE from GlobalAlloc and the LPVOID from GlobalLock came back
+    truncated to their low 32 bits. Copying then wrote through a bogus pointer and
+    SetClipboardData was handed a handle the system did not recognise, so the copy
+    silently did nothing — the failure is invisible without these declarations, which is
+    what made it look like the button was not wired up at all.
+    """
+    global _bound
+    if _bound:
+        return
+
+    kernel32.GlobalAlloc.restype = c_void_p
+    kernel32.GlobalAlloc.argtypes = [c_uint, c_size_t]
+    kernel32.GlobalLock.restype = c_void_p
+    kernel32.GlobalLock.argtypes = [c_void_p]
+    kernel32.GlobalUnlock.argtypes = [c_void_p]
+    kernel32.GlobalFree.restype = c_void_p
+    kernel32.GlobalFree.argtypes = [c_void_p]
+
+    user32.OpenClipboard.argtypes = [c_void_p]
+    user32.SetClipboardData.restype = c_void_p
+    user32.SetClipboardData.argtypes = [c_uint, c_void_p]
+
+    _bound = True
 
 
 def copy(text: str) -> bool:
@@ -25,6 +57,7 @@ def copy(text: str) -> bool:
     try:
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
+        _bind(user32, kernel32)
 
         if not user32.OpenClipboard(None):
             return False
@@ -49,7 +82,7 @@ def copy(text: str) -> bool:
             finally:
                 kernel32.GlobalUnlock(handle)
 
-            if not user32.SetClipboardData(CF_UNICODETEXT, handle):
+            if not user32.SetClipboardData(CF_UNICODETEXT, c_void_p(handle)):
                 kernel32.GlobalFree(handle)
                 return False
 

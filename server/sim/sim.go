@@ -10,6 +10,7 @@ package sim
 import (
 	"math"
 	"math/rand"
+	"sort"
 	"strings"
 
 	"asteroidsalvage/physics"
@@ -74,6 +75,11 @@ const (
 	// KindProp is static map scenery: derelicts, wrecks, broken worlds. Solid and
 	// indestructible; the Tier byte carries which structure to draw. See props.go.
 	KindProp Kind = 5
+
+	// KindPickup is a cargo box drifting in a bubble. Not a physics body — flying into
+	// one collects it rather than bouncing off it — so like the hill and bolts it exists
+	// only as a snapshot entry. The Tier byte carries which item is inside. See items.go.
+	KindPickup Kind = 7
 )
 
 // EventType values are wire values — see shared/protocol.md.
@@ -112,6 +118,11 @@ const (
 	// The King of the Hill control point relocated. Value carries its radius; the new
 	// position rides in the snapshot as a synthetic body.
 	EventHillMoved EventType = 17
+
+	// Cargo boxes. Value carries the ItemID in both cases, so a client can play a
+	// different sound for a missile than for a speed boost without tracking inventory.
+	EventItemPickedUp EventType = 18
+	EventItemUsed     EventType = 19
 )
 
 // NoTeam marks objects that belong to nobody, such as asteroids.
@@ -204,6 +215,19 @@ type Input struct {
 	Fire        bool
 }
 
+// PlayerStats is a pilot's match record. Four numbers rather than a full log, because
+// the only thing that reads them is the end-of-match screen and the question it answers
+// is "what did each of us actually do", not "what happened when".
+//
+// Deliveries and kills are counted where they are already emitted as events, so a stat
+// cannot disagree with what the client saw and heard.
+type PlayerStats struct {
+	Delivered int     // rocks banked at the station
+	Banked    float32 // their total value, which is not the same ranking as the count
+	Kills     int
+	Deaths    int // every death, including rams and station turrets
+}
+
 // Player is a connected participant.
 type Player struct {
 	ID   PlayerID
@@ -240,6 +264,21 @@ type Player struct {
 
 	// Offers are this intermission's randomised choices, rerolled every round.
 	Offers []Offer
+
+	// Items carried, and the effects the used ones are running. Cleared on death: an
+	// item is a window, and one that survives a respawn is a permanent upgrade with
+	// extra steps. See items.go.
+	Items   [ItemSlots]ItemID
+	Effects Effects
+
+	// Stats are what the pilot did over the whole match, for the results screen. They
+	// accumulate like Credits rather than resetting with the round: a round you lost is
+	// still work you did, and the screen that shows them appears once, at the end.
+	Stats PlayerStats
+
+	// impactCooldown blocks repeat collision damage while a contact is sustained. See
+	// HullImpactCooldownTicks.
+	impactCooldown int
 
 	// Combat.
 	Energy    float32
@@ -417,6 +456,18 @@ type Sim struct {
 	nextPID  PlayerID
 	forceBuf []physics.ForceCmd
 
+	// Cargo boxes. They have no physics body, so their positions live here rather than in
+	// the state index, and pickupRespawn is a list of countdowns — one per box taken.
+	pickupPos     map[physics.EntityID]physics.Vec3
+	pickupRespawn []int
+	nextPickupID  uint32
+
+	// hostID is the pilot allowed to start the match from the lobby. 0 until somebody
+	// connects, and it deliberately does not move if they leave: handing the button to
+	// whoever happens to be next would let a joiner start a match the host was still
+	// setting up.
+	hostID PlayerID
+
 	// Rebuilt each tick from the physics snapshot so rules code can look up positions
 	// without paying lagrange's linear scan.
 	states map[physics.EntityID]physics.BodyState
@@ -457,17 +508,18 @@ func New(cfg Config) (*Sim, error) {
 	}
 
 	s := &Sim{
-		cfg:      cfg,
-		matchCfg: cfg.Match,
-		world:    w,
-		Tuning:   DefaultTuning(),
-		objects:  make(map[physics.EntityID]*Object, cfg.MaxEntities),
-		players:  make(map[PlayerID]*Player, 16),
-		teams:    make(map[uint8]*Team, 4),
-		rng:      rand.New(rand.NewSource(cfg.Seed)),
-		nextPID:  1,
-		states:   make(map[physics.EntityID]physics.BodyState, cfg.MaxEntities),
-		forceBuf: make([]physics.ForceCmd, 0, 128),
+		cfg:       cfg,
+		matchCfg:  cfg.Match,
+		world:     w,
+		Tuning:    DefaultTuning(),
+		objects:   make(map[physics.EntityID]*Object, cfg.MaxEntities),
+		players:   make(map[PlayerID]*Player, 16),
+		teams:     make(map[uint8]*Team, 4),
+		rng:       rand.New(rand.NewSource(cfg.Seed)),
+		nextPID:   1,
+		states:    make(map[physics.EntityID]physics.BodyState, cfg.MaxEntities),
+		forceBuf:  make([]physics.ForceCmd, 0, 128),
+		pickupPos: make(map[physics.EntityID]physics.Vec3, PickupCount*2),
 	}
 
 	teamCount := cfg.TeamCount
@@ -510,6 +562,7 @@ func New(cfg Config) (*Sim, error) {
 	}
 	s.initMatch()
 	s.SpawnWave()
+	s.spawnPickups()
 	return s, nil
 }
 
@@ -549,6 +602,75 @@ func (s *Sim) Objects() map[physics.EntityID]*Object { return s.objects }
 // Players exposes all connected players.
 func (s *Sim) Players() map[PlayerID]*Player { return s.players }
 
+// PlayerResult is one pilot's row on the end-of-match screen: who they were, and what
+// their match came to.
+type PlayerResult struct {
+	ID      PlayerID
+	Team    uint8
+	Name    string
+	Stats   PlayerStats
+	Credits float32
+}
+
+// Results is every pilot's match record, in the order the end-of-match screen shows them:
+// by crew, and within a crew by what they banked.
+//
+// The order is decided here rather than on each client because Go map iteration is
+// random — without this, one match would draw a differently-ordered table for every
+// player watching it, and a different one again on the next tick.
+func (s *Sim) Results() []PlayerResult {
+	out := make([]PlayerResult, 0, len(s.players))
+	for _, p := range s.players {
+		out = append(out, PlayerResult{
+			ID: p.ID, Team: p.Team, Name: p.Name, Stats: p.Stats, Credits: p.Credits,
+		})
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.Team != b.Team {
+			return a.Team < b.Team
+		}
+		if a.Stats.Banked != b.Stats.Banked {
+			return a.Stats.Banked > b.Stats.Banked
+		}
+		// Two pilots who banked exactly the same — usually both zero — still need a
+		// stable order, or the table reshuffles between ticks for no visible reason.
+		if a.Name != b.Name {
+			return a.Name < b.Name
+		}
+		return a.ID < b.ID
+	})
+	return out
+}
+
+// RosterEntry is one seat in the lobby.
+type RosterEntry struct {
+	ID   PlayerID
+	Team uint8
+	Name string
+}
+
+// Roster is who is currently connected, ordered by crew and then by join order.
+//
+// Sorted for the same reason Results is: the lobby is a list everyone is looking at
+// together, and Go map iteration would otherwise reshuffle it several times a second.
+// Within a crew the order is by id, which is join order — so a pilot's row does not jump
+// around as other people arrive.
+func (s *Sim) Roster() []RosterEntry {
+	out := make([]RosterEntry, 0, len(s.players))
+	for _, p := range s.players {
+		out = append(out, RosterEntry{ID: p.ID, Team: p.Team, Name: p.Name})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Team != out[j].Team {
+			return out[i].Team < out[j].Team
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
 // States returns the physics state index built during the last Step.
 func (s *Sim) States() map[physics.EntityID]physics.BodyState { return s.states }
 
@@ -568,8 +690,12 @@ func (s *Sim) emit(e Event) { s.events = append(s.events, e) }
 // AddPlayer spawns a ship and assigns a team. teamPref of 0xFF auto-balances onto the
 // smallest team, which is what makes the match scale from 2 players to 16 without
 // special cases.
+// AddPlayer seats a joining pilot, or returns nil when every crew is full.
 func (s *Sim) AddPlayer(name string, teamPref uint8) *Player {
-	team := s.pickTeam(teamPref)
+	team, ok := s.pickTeam(teamPref)
+	if !ok {
+		return nil
+	}
 
 	pos := s.spawnPointFor(s.nextPID, team)
 	ship := s.world.SpawnSphere(ShipMass, ShipRadius, pos)
@@ -595,6 +721,14 @@ func (s *Sim) AddPlayer(name string, teamPref uint8) *Player {
 	p.Energy = p.MaxEnergy()
 	p.Boost = p.MaxBoost()
 	s.nextPID++
+
+	// The first pilot through the door owns the lobby. A hosting client launches the
+	// server and connects to it immediately, before it has told anybody else the
+	// address, so in practice this is always the person who pressed HOST — and it needs
+	// no shared secret between a process and the client that spawned it.
+	if s.hostID == 0 {
+		s.hostID = p.ID
+	}
 
 	s.players[p.ID] = p
 	s.objects[ship] = &Object{
@@ -643,23 +777,61 @@ func (s *Sim) spawnPointFor(id PlayerID, team uint8) physics.Vec3 {
 	}
 }
 
-func (s *Sim) pickTeam(pref uint8) uint8 {
+// pickTeam chooses a crew for a joining player, reporting false when every crew is
+// already at TeamSize.
+//
+// The fallback used to take the smallest team unconditionally, which meant team size was
+// only ever a preference: a seventeenth player in a 4x4 match silently made one crew five
+// strong. The lobby shows slots per team, and a slot count that a join can overrun is
+// worse than no slot count at all.
+func (s *Sim) pickTeam(pref uint8) (uint8, bool) {
 	if s.cfg.Coop {
-		return 0
+		// Co-op is one team containing everyone, so its cap is the whole match — sized
+		// from the configured team count, not from len(s.teams), which is 1 here by
+		// definition and would cap a sixteen-player co-op game at four.
+		t := s.teams[0]
+		if t != nil && t.Members >= s.coopCapacity() {
+			return 0, false
+		}
+		return 0, true
 	}
 	if t, ok := s.teams[pref]; ok && t.Members < s.cfg.TeamSize {
-		return pref
+		return pref, true
 	}
-	// Smallest team wins; ties break toward the lowest id for determinism.
+	// Smallest team with room wins; ties break toward the lowest id for determinism.
 	best := uint8(0)
 	bestN := math.MaxInt
+	found := false
 	for id := 0; id < len(s.teams); id++ {
 		t := s.teams[uint8(id)]
-		if t != nil && t.Members < bestN {
-			best, bestN = t.ID, t.Members
+		if t != nil && t.Members < bestN && t.Members < s.cfg.TeamSize {
+			best, bestN, found = t.ID, t.Members, true
 		}
 	}
-	return best
+	return best, found
+}
+
+// Full reports whether every crew is at capacity, so the match cannot take anyone else.
+func (s *Sim) Full() bool {
+	_, ok := s.pickTeam(NoTeam)
+	return !ok
+}
+
+// coopCapacity is how many pilots the single co-op crew holds: the whole match.
+func (s *Sim) coopCapacity() int {
+	teams := s.cfg.TeamCount
+	if teams < 1 {
+		teams = 1
+	}
+	return s.cfg.TeamSize * teams
+}
+
+// TeamCapacity is how many pilots one crew holds. The lobby draws this many slots.
+func (s *Sim) TeamCapacity() int {
+	if s.cfg.Coop {
+		return s.coopCapacity()
+	}
+	return s.cfg.TeamSize
 }
 
 // RemovePlayer drops a player's ship and releases anything they were holding.
@@ -879,6 +1051,9 @@ func (s *Sim) Step() {
 	s.applyImpactDamage(&tune)
 	// Straight after the impact pass, which is what refreshes lastCollisions.
 	s.applyRamming()
+	// And then what the ram rule does not cover: flying into rocks and scenery, which
+	// scales with speed rather than being all-or-nothing.
+	s.applyHullImpacts()
 	s.updateWeapons()
 	// After the players, so a station's guns and a pilot's land in the same shot list and
 	// go out in the same broadcast.
@@ -889,6 +1064,10 @@ func (s *Sim) Step() {
 	s.updateHoard()
 	// King of the Hill scores by presence; a no-op in every other mode.
 	s.updateKoth()
+
+	// Cargo boxes: collect anything flown through, run the item timers down.
+	s.updatePickups()
+	s.updateEffects()
 
 	// Keep the field stocked: once the belt is nearly cleared, escalate. Not during
 	// intermissions or after the match — the field is deliberately empty then.
@@ -1076,6 +1255,12 @@ func (s *Sim) checkDeposits() {
 		for _, hid := range holders {
 			if hp, ok := s.players[hid]; ok {
 				hp.Credits += share
+				// Stats follow the payout: a rock two crews dragged home is a delivery
+				// for both of them, worth what each was actually paid. Crediting only
+				// the one who tripped the radius would make the second beam on a massive
+				// look like it did nothing.
+				hp.Stats.Delivered++
+				hp.Stats.Banked += share
 				hp.Held = 0
 			}
 		}

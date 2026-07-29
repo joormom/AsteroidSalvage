@@ -135,18 +135,15 @@ def main() -> int:
             time.sleep(1 / 30)
             continue
 
-        # Aim high by however far the round will fall on the way. Rounds travel and drop
-        # now, so pointing straight at a target puts the shot under it — this is the same
-        # correction a player makes, and testing without it would only prove that a flat
-        # shot misses.
-        flat = math.dist((me.pos.x, me.pos.y, me.pos.z), (him.pos.x, him.pos.y, him.pos.z))
-        flight = flat / proto.BOLT_SPEED
-        lifted = type(him.pos)(
-            him.pos.x, him.pos.y, him.pos.z + 0.5 * proto.BOLT_DROP * flight * flight
-        )
-
-        cmd, dist = steer_toward(me.pos, me.rot, lifted)
-        aim = aim_dot(me.pos, me.rot, lifted)
+        # Point straight at it. Rounds used to arc, and this aimed high by however far one
+        # would fall on the way; with a flat trajectory that hold-over would now put every
+        # shot *over* the target, so the correction has to go when the drop does.
+        #
+        # The target is braking rather than crossing, so there is no lead to apply either
+        # — which keeps this a test of whether shots connect at all, not of the autopilot's
+        # marksmanship.
+        cmd, dist = steer_toward(me.pos, me.rot, him.pos)
+        aim = aim_dot(me.pos, me.rot, him.pos)
 
         # Hold well off the target. Ships are twice as fast as they were and a collision
         # above 20 m/s now destroys both of them — closing to 80 m meant the shooter rammed

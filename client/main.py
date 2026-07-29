@@ -27,6 +27,9 @@ from panda3d.core import Filename, WindowProperties, loadPrcFileData  # noqa: E4
 import asteroid_protocol as proto  # noqa: E402
 from audio import Audio  # noqa: E402
 import controls as controls_mod  # noqa: E402
+import keybinds  # noqa: E402
+from chat import Chat  # noqa: E402
+from hotbar import Hotbar  # noqa: E402
 from hud import HUD  # noqa: E402
 from interp import Interpolator  # noqa: E402
 import cosmetics  # noqa: E402
@@ -38,6 +41,7 @@ from pause import PauseMenu  # noqa: E402
 # and shadowing it is a coin toss in a frozen build's module resolution.
 from playerprofile import Profile  # noqa: E402
 from render import SceneRenderer  # noqa: E402
+from results import ResultsScreen  # noqa: E402
 from shop import Shop  # noqa: E402
 import updater  # noqa: E402
 
@@ -46,10 +50,18 @@ INPUT_HZ = 30.0
 
 class Game(ShowBase):
     def __init__(self, args):
+        # Read before the window exists, because antialiasing and vsync are chosen when
+        # it is created and cannot be changed afterwards — which is why the graphics
+        # screen says those two apply on the next launch.
+        saved = keybinds.load_settings()
+
         loadPrcFileData("", "window-title Asteroid Salvage")
-        loadPrcFileData("", "framebuffer-multisample 1")
-        loadPrcFileData("", "multisamples 4")
-        loadPrcFileData("", "sync-video 1")
+        samples = int(saved.get("multisamples", 4))
+        loadPrcFileData("", f"framebuffer-multisample {1 if samples else 0}")
+        loadPrcFileData("", f"multisamples {samples}")
+        loadPrcFileData("", f"sync-video {1 if saved.get('vsync', True) else 0}")
+        if saved.get("fullscreen"):
+            loadPrcFileData("", "fullscreen 1")
 
         super().__init__()
 
@@ -59,14 +71,31 @@ class Game(ShowBase):
 
         self.disableMouse()  # the chase camera owns the view
 
+        # Saved preferences underneath, command-line flags on top: a flag is an explicit
+        # instruction for this run, so it wins over what was last chosen on a screen.
+        self.settings = dict(saved)
+        for key, value, default in (
+            ("sensitivity", args.sensitivity, controls_mod.DEFAULT_SENSITIVITY),
+            ("invert_y", args.invert_y, False),
+            ("sfx_volume", args.sfx_volume, 0.7),
+            ("music_volume", args.music_volume, 0.5),
+        ):
+            if value != default:
+                self.settings[key] = value
+
         self.profile = Profile.load()
         self.scene = SceneRenderer(self, self._loadout_specs())
         self.hud = HUD(self)
-        # Control hints belong to the game, not the menus — they showed through the
-        # backdrop and made the front-end look unfinished.
-        self.hud.set_help("")
-        self.controls = controls_mod.Controls(self, sensitivity=args.sensitivity)
-        self.controls.invert_y = args.invert_y
+        # The three item slots, and the chat log with its composer. Both outlive a single
+        # match, like the HUD does.
+        self.hotbar = Hotbar(self)
+        self.chat = Chat(self, self._say, None)
+        # One registry, read by the flight controls and by this class. Loaded
+        # before Controls, which binds from it.
+        self.binds = keybinds.Keybinds.load()
+        self.controls = controls_mod.Controls(
+            self, sensitivity=self.settings["sensitivity"], binds=self.binds)
+        self.controls.invert_y = self.settings["invert_y"]
 
         # Mouse capture is deferred until a game is actually joined — the menu needs a
         # visible cursor to click buttons and a text field.
@@ -75,6 +104,8 @@ class Game(ShowBase):
         # The losing motherships' send-off. Owns its own overlay, so it survives across
         # matches without being rebuilt.
         self.matchend = MatchEndSequence(self, self.scene)
+        # The table the send-off leads into. Also outlives a single match.
+        self.results = ResultsScreen(self)
         self.net: NetClient | None = None
         self.shop: Shop | None = None
         self.menu: Menus | None = None
@@ -84,12 +115,6 @@ class Game(ShowBase):
         self._connecting = False
 
         # Shared with the settings screen so changes apply without a restart.
-        self.settings = {
-            "sensitivity": args.sensitivity,
-            "invert_y": args.invert_y,
-            "sfx_volume": args.sfx_volume,
-            "music_volume": args.music_volume,
-        }
 
         # Sounds are synthesised and cached on first run; this degrades to silence if
         # anything about that fails.
@@ -103,6 +128,10 @@ class Game(ShowBase):
         self._own_ship = 0
         self._own_player = 0
         self._own_team = 0
+        # Right-click edge detector, for firing a selected item once per press.
+        self._rclick_was_down = False
+        # Rate limit for --demo-items spending what it collects.
+        self._demo_use_at = 0.0
 
         # Self-capture. Grabbing the desktop from outside is unreliable — it photographs
         # whatever window happens to be on top — so the client renders its own frame.
@@ -116,9 +145,15 @@ class Game(ShowBase):
         self._demo = args.demo
         self._demo_fire = args.demo_fire
         self._demo_big = args.demo_big
+        self._demo_items = args.demo_items
+        self._shot_chat = args.shot_chat
         self._shot_hauling = args.shot_hauling
-        self._shot_losers = args.shot_losers or args.shot_winner
+        # The results table only exists after the send-off has played, so asking for it
+        # implies the sequence that leads to it.
+        self._shot_losers = args.shot_losers or args.shot_winner or args.shot_results
         self._shot_winner = args.shot_winner
+        self._shot_results = args.shot_results
+        self._shot_lobby = args.shot_lobby
         self._shot_laser = args.shot_laser
         self._shot_boosting = args.shot_boosting
 
@@ -138,6 +173,10 @@ class Game(ShowBase):
             on_exit=self.user_exit,
         )
         self.accept("escape", self._on_escape)
+
+        self._game_bound: list[str] = []
+        self._apply_bindings()
+
         self.taskMgr.add(self._tick, "client-tick")
 
         # Look for a newer build in the background. Inert in a source checkout, and it
@@ -151,13 +190,24 @@ class Game(ShowBase):
             self._begin_connect(args.url)
         else:
             self.menu = Menus(self, self._begin_connect, self.settings, self.profile,
-                              on_apply_loadout=self._apply_loadout)
+                              on_apply_loadout=self._apply_loadout,
+                              on_start_match=self._start_match,
+                              on_leave_lobby=self._leave_game,
+                              on_set_team=self._set_team,
+                              player_name=args.name,
+                              binds=self.binds, on_rebind=self.rebind,
+                              on_settings_changed=self._save_settings)
             if args.shot_screen:
                 self.menu.show(args.shot_screen)
             if args.host:
                 # Straight into a solo game: start the bundled server and connect. Also
                 # how the packaged build's hosting path gets exercised automatically.
                 self.taskMgr.doMethodLater(0.2, self._auto_host, "auto-host")
+            elif args.join:
+                # The mirror of --host: drive the menu's JOIN rather than connecting
+                # behind its back, so the joiner's path through the lobby is the one a
+                # player actually takes. --url skips the menu and cannot exercise it.
+                self.taskMgr.doMethodLater(0.2, self._auto_join, "auto-join")
 
     def _on_update_ready(self, version: str, staged: str) -> None:
         """A newer build is downloaded and waiting. Called from the updater's thread.
@@ -172,7 +222,157 @@ class Game(ShowBase):
         if self.menu is not None:
             self.menu.show("host")
             self.menu._host()
+            # --host is the unattended path: a solo game, a playtest, or the packaged
+            # build proving it can host itself. Nobody is there to press BEGIN MATCH, so
+            # it starts the moment the lobby is up rather than waiting for a click —
+            # unless we are here precisely to photograph the lobby.
+            if not self._shot_lobby:
+                self.taskMgr.doMethodLater(0.6, self._auto_start, "auto-start")
         return task.done
+
+    def _auto_join(self, task):
+        if self.menu is not None:
+            self.menu.show("play")
+            self.menu.join_entry.enterText(self._args.join)
+            self.menu._join()
+        return task.done
+
+    def _auto_start(self, task):
+        if self.net is None or self.net.welcome is None:
+            return task.again  # still connecting
+        self._start_match()
+        return task.done
+
+    def _start_match(self) -> None:
+        """Leave the lobby. Ignored by the server unless this client is the host."""
+        if self.net is not None:
+            self.net.start_match()
+
+    def _set_team(self, team: int) -> None:
+        """Move crew from the lobby. The server refuses if that one is full."""
+        if self.net is not None:
+            self.net.set_team(team)
+
+    # --- chat and items ----------------------------------------------------
+
+    def _say(self, channel: int, text: str) -> None:
+        if self.net is not None:
+            self.net.say(channel, text)
+
+    def _save_settings(self) -> None:
+        """Persist the sound and graphics choices.
+
+        Keybinds save themselves the moment one changes — a rebind is fiddly enough that
+        losing it to a crash would be maddening. These are cycler clicks, so saving on
+        change is enough and there is no separate Apply to forget.
+        """
+        keybinds.save_settings(self.settings)
+        # Dust is the one graphics option that can be applied without rebuilding the
+        # window, so it is applied here rather than waiting for a relaunch.
+        self.scene.set_dust_enabled(not self.settings.get("no_dust"))
+
+    def _apply_bindings(self) -> None:
+        """(Re)register the keys this class owns, from the shared registry.
+
+        The flight keys live in Controls; these are the ones that belong to the game
+        around it. Both read the same file, so the settings screen changes one thing.
+        """
+        for event in self._game_bound:
+            self.ignore(event)
+        self._game_bound = []
+
+        def bind(action, fn, extra=None):
+            key = self.binds.key(action)
+            if not key:
+                return
+            for event in controls_mod.Controls.events_for(key):
+                self.accept(event, fn, extra or [])
+                self._game_bound.append(event)
+
+        # Chat opens on its key and the composer takes the keyboard from there; TAB
+        # inside it switches channel. Outside it TAB still frees the cursor, which is
+        # what it always did — chat is not a reason to lose a binding.
+        bind("chat", self._open_chat)
+
+        # Item slots select rather than fire; right-click commits. The wheel is not
+        # rebindable — it is the only two-way control on the mouse and there is nothing
+        # sensible to swap it with.
+        for i in range(proto.ITEM_SLOTS):
+            bind(f"item_{i + 1}", self._number_key, [i])
+
+        # The shop's fourth offer has no hotbar slot behind it, so it is bound to
+        # whatever "4" is rather than to an action.
+        self.accept("4", self._number_key, [3])
+        self._game_bound.append("4")
+
+        self.accept("wheel_up", self._cycle_item, [-1])
+        self.accept("wheel_down", self._cycle_item, [1])
+
+    def rebind(self) -> None:
+        """Called by the settings screen after a key changes."""
+        self._apply_bindings()
+        self.controls.apply_bindings()
+
+    def _open_chat(self) -> None:
+        # Only in a game, and never on top of the pause overlay or the results table —
+        # both of those are states where the keyboard belongs to something else.
+        if self.net is None or self.menu is not None:
+            return
+        if self.pause.visible or self.results.visible:
+            return
+        self.chat.open()
+        self.controls.set_typing(True)
+
+    def _number_key(self, index: int) -> None:
+        """1-4. The shop owns them while it is open; the hotbar owns them otherwise.
+
+        One handler because Panda3D's accept() replaces a binding rather than adding to
+        it, so two owners of "1" means one of them silently never fires.
+        """
+        if self.chat.composing:
+            return  # the composer is typing a number, not pressing a hotkey
+        if self.shop is not None and self.shop.visible:
+            self.shop.buy(index)
+            return
+        if index < proto.ITEM_SLOTS:
+            # Selects rather than fires. Firing on the key press meant a missile left the
+            # rail the instant it was chosen, with the ship pointing wherever it happened
+            # to be pointing — there was no moment in which to aim it. Now the key arms
+            # the slot and right-click commits, which is one rule for every item.
+            self._select_item(index)
+
+    def _select_item(self, slot: int) -> None:
+        if self.net is not None and self.menu is None:
+            self.hotbar.select(slot)
+
+    def _use_item(self, slot: int) -> None:
+        if self.net is None or self.menu is not None:
+            return
+        self.net.use_item(slot)
+
+    def _apply_item_binding(self, intent: dict) -> dict:
+        """Right-click fires the selected item; with none selected it stays the beam.
+
+        Fired on the press edge rather than while held: an item is spent once, and a
+        held button would empty all three slots in a tenth of a second. The grab flag is
+        cleared in the same breath, so the beam does not also reach for a rock — one
+        button doing two things at once is worse than either.
+        """
+        if self.hotbar.selected_item(self.net.player) == proto.ITEM_NONE:
+            self._rclick_was_down = intent.get("grab", False)
+            return intent
+
+        pressed = intent.get("grab", False)
+        if pressed and not self._rclick_was_down:
+            self._use_item(self.hotbar.selected)
+        self._rclick_was_down = pressed
+
+        intent["grab"] = False
+        return intent
+
+    def _cycle_item(self, delta: int) -> None:
+        if self.net is not None and self.menu is None and not self.chat.composing:
+            self.hotbar.cycle(delta)
 
     def _begin_connect(self, url: str) -> None:
         """Start a connection attempt. The menu stays up until it succeeds."""
@@ -180,10 +380,18 @@ class Game(ShowBase):
             return
         self._connecting = True
 
-        self.net = NetClient(url, self._args.name, self._args.team)
+        # The menu's picker wins over --team when there is a menu: the flag exists for
+        # the headless paths that never open one.
+        team_pref = self._args.team
+        if self.menu is not None:
+            team_pref = self.menu.team_pref
+        self.net = NetClient(url, self._args.name, team_pref)
         self.net.start()
         self.shop = Shop(self, self.net)
         self._connect_deadline = globalClock.getRealTime() + 6.0
+        # How long to wait for the first MatchState once connected, before giving up on
+        # knowing the phase and going straight in. MatchState is broadcast at 2 Hz.
+        self._phase_deadline = globalClock.getRealTime() + 8.0
         print(f"connecting to {url} as {self._args.name!r}")
 
     def _track_achievements(self, event, bodies) -> None:
@@ -228,6 +436,19 @@ class Game(ShowBase):
             self.hud.show_unlock(ach.name)
             p.save()
 
+    def _shooter_pos(self, player_id: int):
+        """Where the shot came from, so an impact can be put on the near face.
+
+        Events carry the shooting *player*, not their hull, and the client has no player
+        index — so this walks the ships it can see. None for a station turret or a pilot
+        who has since left, which just puts the spark at the body's centre.
+        """
+        if not player_id:
+            return None
+        if player_id == self._own_player:
+            return self.scene.entity_pos(self._own_ship)
+        return None
+
     def _react_to_event(self, event) -> None:
         """Turn combat events into things you can see and hear.
 
@@ -263,7 +484,29 @@ class Game(ShowBase):
                 else "STATION BREACHED"
             )
 
+        elif event.type == proto.EVENT_SHIP_HIT:
+            # Sparks off the hull, in the victim's colours. Every hit anyone lands is
+            # drawn, not only your own: a fight happening across the belt should be
+            # visible as a fight, and it is the only way to tell you are being shot at
+            # from behind.
+            self.scene.impact(event.entity, event.value,
+                              shooter_pos=self._shooter_pos(event.player))
+
+        elif event.type == proto.EVENT_ASTEROID_HIT:
+            tier = self.scene.tier_of(event.entity)
+            self.scene.impact(event.entity, event.value,
+                              rgb=proto.TIER_COLORS.get(tier, (1.0, 0.85, 0.45)),
+                              shooter_pos=self._shooter_pos(event.player))
+
+        elif event.type == proto.EVENT_SHIELD_ABSORBED:
+            # A station shield eating a round: flare the bubble's colour rather than
+            # sparking the hull, so "that did nothing" is legible from a distance.
+            self.scene.impact(event.entity, event.value, rgb=(0.55, 0.85, 1.0),
+                              shooter_pos=self._shooter_pos(event.player))
+
         elif event.type == proto.EVENT_MOTHERSHIP_HIT:
+            self.scene.impact(event.entity, event.value,
+                              shooter_pos=self._shooter_pos(event.player))
             # Only your own station raises an alarm. Being told about every hit anyone
             # lands on anyone would make the one that matters invisible.
             if self._own_team == self.scene.team_of(event.entity):
@@ -286,9 +529,14 @@ class Game(ShowBase):
         self.scene.set_loadout(self._loadout_specs())
 
     def _on_escape(self) -> None:
-        """ESC: pause in-game, quit from the menus."""
+        """ESC: pause in-game, quit from the menus, leave from the results table."""
         if self.menu is not None:
             self.user_exit()
+            return
+        if self.results.visible:
+            # Pausing a match that is already over has nothing to resume, and the table
+            # says "Esc to leave the match" — so it had better leave it.
+            self._leave_game()
             return
         self.pause.toggle()
         if not self.pause.visible:
@@ -319,6 +567,12 @@ class Game(ShowBase):
         # Clear the world so the next game does not start with the last one's asteroids
         # frozen in place.
         self.matchend.stop()
+        self.results.hide()
+        self.hud.set_visible(True)
+        self.chat.close()
+        self.chat.set_visible(False)
+        self.controls.set_typing(False)
+        self.hotbar.set_visible(False)
         self.scene.clear()
         self.interp = Interpolator()
         self._own_ship = 0
@@ -327,10 +581,15 @@ class Game(ShowBase):
         self._last_phase = None
         self._connecting = False
         self.hud.reset()
-        self.hud.set_help("")
 
         self.menu = Menus(self, self._begin_connect, self.settings, self.profile,
-                              on_apply_loadout=self._apply_loadout)
+                              on_apply_loadout=self._apply_loadout,
+                              on_start_match=self._start_match,
+                              on_leave_lobby=self._leave_game,
+                              on_set_team=self._set_team,
+                              player_name=args.name,
+                              binds=self.binds, on_rebind=self.rebind,
+                              on_settings_changed=self._save_settings)
 
     def _sync_mouse_to_phase(self, match) -> None:
         """Hand the cursor to the shop during intermissions, take it back for flight.
@@ -359,6 +618,25 @@ class Game(ShowBase):
         which is exactly the confusion the menu exists to avoid.
         """
         if self.net.welcome is not None:
+            match = self.net.match
+
+            # Wait for the first MatchState before deciding what to show. Dismissing the
+            # menu on the Welcome alone would drop somebody who joined a lobby into an
+            # empty world for half a second before the phase arrived to say the match had
+            # not started. Bounded, so a server that never sends one cannot strand us on
+            # the menu.
+            if match is None and globalClock.getRealTime() < self._phase_deadline:
+                return False
+
+            # A lobby is a connected state that is still the menu: the host screen stays
+            # up, filling in with whoever joins. This covers joiners as well as the host —
+            # everyone waiting on the same lobby should be looking at it.
+            if match is not None and match.phase == proto.PHASE_LOBBY:
+                self.menu.enter_lobby(self.net.roster, self.net.welcome.player_id,
+                                      self.net.teams)
+                return False
+            self.menu.lobby_active = False
+
             # Hold on to the menu even after hiding it: it owns the server process this
             # client may have started, and dropping the reference here leaked a running
             # server every time the player quit — which then held port 8080 and broke
@@ -371,17 +649,12 @@ class Game(ShowBase):
             self.controls.invert_y = self.settings["invert_y"]
             if self.menu.team_name:
                 self.net.set_team_name(self.menu.team_name)
-            # Colour is a property of the team on the server, so it is claimed here
-            # rather than passed as a launch flag — which makes it work when joining
-            # someone else's game as well as when hosting one.
-            colour = getattr(self.menu, "team_color", None)
-            if colour is not None:
-                self.net.set_team_color(colour)
 
             self.menu.hide()
             self.menu = None
-            self.hud.set_help(controls_mod.HELP_TEXT)
             self.audio.set_in_game(True)
+            self.chat.set_visible(True)
+            self.hotbar.set_visible(True)
 
             # Flight controls come alive only now; until this point the cursor belongs
             # to the menus.
@@ -428,6 +701,15 @@ class Game(ShowBase):
             return task.cont
 
         if self.menu is not None and not self._await_connection():
+            # The lobby is a connected state that still shows the menu, so it never
+            # reaches the in-game capture further down. --shot-lobby captures it here,
+            # once the roster has actually arrived — a photograph of an empty panel
+            # taken before the first 0x89 would prove nothing.
+            self._frames += 1
+            if (self._shot_path and self._shot_lobby
+                    and self._frames >= self._shot_at
+                    and self.menu.lobby_active and self.net.roster is not None):
+                self._save_shot()
             return task.cont
 
         # Read and recentre the pointer before sampling intent.
@@ -461,7 +743,13 @@ class Game(ShowBase):
         self.scene.sync(bodies, self._own_ship)
         # Show the beam whenever the button is down, so a missed grab is visibly a miss
         # rather than indistinguishable from a broken beam.
-        beaming = self.controls.sample()["grab"] if not self._demo else True
+        # Gated on the same rule the input is: with an item selected, right-click fires
+        # that instead, so the beam must not be drawn reaching for something.
+        beaming = (
+            True if self._demo
+            else (self.controls.sample()["grab"]
+                  and self.hotbar.selected_item(self.net.player) == proto.ITEM_NONE)
+        )
         self.scene.update_guidance(
             self._own_ship,
             held.pos if held else None,
@@ -491,6 +779,18 @@ class Game(ShowBase):
         self.scene.effects.update(dt)
         self.matchend.update(dt)
 
+        # The send-off hands over to the table once it has played out. Guarded on the
+        # screen not already being up rather than on a one-shot flag, so leaving and
+        # joining another match gets a fresh one.
+        if self.matchend.finished and not self.results.visible:
+            self.matchend.clear_banner()
+            # The clock, scores and status bars belong to a match that is over, and they
+            # are parented to the screen corners rather than behind this overlay.
+            self.hud.set_visible(False)
+            self.results.show(
+                self.net.results, self.net.match, self.net.teams, self._own_player
+            )
+
         # Input at a fixed rate rather than per frame: a 240 Hz machine should not get
         # eight times the input bandwidth of a 30 Hz one.
         self._input_accum += dt
@@ -501,7 +801,7 @@ class Game(ShowBase):
                 if self._demo:
                     intent = self._demo_input(bodies, own_pos, mothership_pos, held)
                 else:
-                    intent = self.controls.sample()
+                    intent = self._apply_item_binding(self.controls.sample())
                 # Remembered so the boost roar and the bar follow what was actually
                 # sent, rather than re-sampling the keyboard on a different frame.
                 self._last_intent = intent
@@ -533,6 +833,17 @@ class Game(ShowBase):
                                    if b.kind == proto.KIND_MOTHERSHIP},
                          hill=self._hill_status(bodies, own_pos))
         self.shop.update(self.net.match, self.net.player)
+
+        # Chat and the hotbar. The composer owning the keyboard is mirrored onto the
+        # flight controls here rather than pushed from chat.py, so closing it by any
+        # route — Enter, Escape, leaving the match — hands the keys back.
+        for say in self.net.take_chat():
+            self.chat.add(say)
+        self.chat.update(dt)
+        if self.controls.typing != self.chat.composing:
+            self.controls.set_typing(self.chat.composing)
+
+        self.hotbar.update(self.net.player)
         self._sync_mouse_to_phase(self.net.match)
 
         self._frames += 1
@@ -541,8 +852,13 @@ class Game(ShowBase):
         ready = self._frames >= self._shot_at and (
             held is not None or not self._shot_hauling
         )
-        if ready and self._shot_laser and self.scene.effects.bolts_live == 0:
-            ready = False
+        if ready and self._shot_laser:
+            # A round in flight is a snapshot body now, not a client-side effect. This
+            # used to count effects.bolts_live, which nothing has fed since bolts stopped
+            # being hitscan — so the flag waited forever for a condition that could not
+            # occur, and --shot-laser simply hung.
+            if not any(b.kind == proto.KIND_BOLT for b in bodies):
+                ready = False
         if ready and self._shot_boosting:
             # Wait for a frame where the tank is visibly part-spent, not full and not
             # empty — a full bar proves nothing about whether boost drains.
@@ -565,7 +881,13 @@ class Game(ShowBase):
             # Fire the end-of-match sequence by hand and let it play far enough to
             # capture the payoff. Exercises the real code path — nothing here is a
             # mock-up of the overlay.
-            if not self.matchend.active and self.matchend.banner.isHidden():
+            #
+            # --shot-results waits for the table the sequence hands over to, and is
+            # tested first: by the time that table is up the sequence is inactive with
+            # its banner down, which is precisely the state a fresh one starts from.
+            if self._shot_results and self.results.visible:
+                pass  # the table is up — fall through and capture it
+            elif not self.matchend.active and not self.matchend.finished:
                 # --shot-losers watches somebody else's station come apart;
                 # --shot-winner is the same sequence from the winning seat, which is a
                 # different overlay and worth being able to capture on its own.
@@ -573,8 +895,19 @@ class Game(ShowBase):
                           else (self._own_team + 1) % 4)
                 self.matchend.start(self._own_team, viewer, self.net.teams)
                 return task.cont
-            if self.matchend.banner.isHidden():
+            elif self._shot_results or self.matchend.banner.isHidden():
                 return task.cont
+
+        if self._shot_path and ready and self._shot_chat and not self.chat.composing:
+            # Send a line so the log has something in it, then open the composer on the
+            # TEAM channel — the two halves of the feature, in one frame. Exercises the
+            # real path: this goes to the server and comes back like anyone else's.
+            self.net.say(proto.CHAT_ALL, "watch the rock on your six")
+            self._open_chat()
+            self.chat.toggle_channel()
+            self.chat._text = "on it"
+            self.chat._refresh_prompt()
+            return task.cont
 
         if self._shot_path and ready:
             if self._shot_pause and not self.pause.visible:
@@ -676,6 +1009,31 @@ class Game(ShowBase):
         ship = next((b for b in bodies if b.entity == self._own_ship), None)
         if ship is None or own_pos is None:
             return {"grab": True}
+
+        if self._demo_items:
+            # Hunt cargo boxes and fly through them, spending whatever turns up. Boxes
+            # are scattered far wider than the belt, so the hauling autopilot would never
+            # happen past one — this is the only way to capture the hotbar and the shield
+            # bar with anything in them.
+            player = self.net.player
+            if player is not None and globalClock.getRealTime() > self._demo_use_at:
+                slot = next((i for i, it in enumerate(player.items)
+                             if it != proto.ITEM_NONE), None)
+                if slot is not None:
+                    self.hotbar.select(slot)
+                    self.net.use_item(slot)
+                    self._demo_use_at = globalClock.getRealTime() + 1.5
+
+            boxes = [b for b in bodies if b.kind == proto.KIND_PICKUP]
+            if boxes:
+                goal = min(
+                    boxes,
+                    key=lambda r: math.dist(
+                        (own_pos.x, own_pos.y, own_pos.z), (r.pos.x, r.pos.y, r.pos.z)
+                    ),
+                ).pos
+                cmd, _dist = steer_toward(ship.pos, ship.rot, goal)
+                return cmd
 
         if self._demo_big:
             # Hunt the biggest thing in the belt and shoot it apart. Exercises the late
@@ -852,7 +1210,8 @@ def main():
     ap.add_argument(
         "--shot-screen",
         default=None,
-        choices=["main", "play", "host", "settings", "editor"],
+        choices=["main", "play", "host", "settings", "settings_sound",
+                 "settings_video", "settings_controls", "editor"],
         help="with --shot-menu, which menu screen to capture",
     )
     ap.add_argument(
@@ -910,6 +1269,31 @@ def main():
         help="with --shot, play the end-of-match loser explosion before capturing",
     )
     ap.add_argument(
+        "--shot-chat",
+        action="store_true",
+        help="with --shot, send a line and open the composer before capturing",
+    )
+    ap.add_argument(
+        "--demo-items",
+        action="store_true",
+        help="with --demo, fly through cargo boxes instead of hauling rocks",
+    )
+    ap.add_argument(
+        "--join",
+        default=None,
+        help="drive the menu's JOIN with this address (the mirror of --host)",
+    )
+    ap.add_argument(
+        "--shot-lobby",
+        action="store_true",
+        help="with --host --shot, open the lobby and capture it instead of starting",
+    )
+    ap.add_argument(
+        "--shot-results",
+        action="store_true",
+        help="with --shot, play the end-of-match sequence through to the results table",
+    )
+    ap.add_argument(
         "--shot-laser",
         action="store_true",
         help="with --shot, wait until a laser beam is on screen before capturing",
@@ -939,7 +1323,11 @@ def main():
     # started.
     if args.url is None and args.demo and not args.host:
         args.url = "ws://localhost:8080/ws"
-    if args.url is None and args.shot and not args.shot_menu and not args.host:
+    # A --shot run with no destination assumes a local server, so screenshot commands
+    # stay short. --join is a destination like --url is, so it must not be overridden:
+    # doing so connected behind the menu's back and skipped the very path being tested.
+    if (args.url is None and args.shot and not args.shot_menu
+            and not args.host and not args.join):
         args.url = "ws://localhost:8080/ws"
 
     Game(args).run()
