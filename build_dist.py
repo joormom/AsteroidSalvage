@@ -157,6 +157,12 @@ def build_server() -> str:
     env = dict(os.environ)
     env["PATH"] = GO_BIN + os.pathsep + MINGW_BIN + os.pathsep + env.get("PATH", "")
     env["CGO_ENABLED"] = "1"
+    # Required by server/core, which contains C++ (EnTT). cgo's LDFLAGS allowlist rejects
+    # --whole-archive, and that flag is what keeps libwinpthread-1.dll out of server.exe —
+    # without it the binary needs three MinGW DLLs that Windows does not ship and this
+    # script does not copy, so it would start here and fail on a player's machine. See the
+    # LDFLAGS comment in server/core/core.go.
+    env["CGO_LDFLAGS_ALLOW"] = r"-Wl,--(no-)?whole-archive"
 
     os.makedirs(os.path.join(ROOT, "bin"), exist_ok=True)
     exe = os.path.join(ROOT, "bin", "server.exe")
