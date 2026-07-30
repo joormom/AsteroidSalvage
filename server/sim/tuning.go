@@ -29,11 +29,23 @@ type Tuning struct {
 	GrabReactionScale float32 // how much of the reaction force the ship feels
 	GrabRange         float32 // m; how far the tractor beam reaches to acquire
 
-	// Ship handling.
+	// Ship handling. Rotation runs through the ART_OF_FLIGHT rate loop (package
+	// flight); ShipTorque and ShipAngularDamping still mean what they always did, but
+	// they now reach the controller as a rate setpoint and a proportional gain. See
+	// Sim.controlShip for why that is the same arithmetic.
 	ShipThrust         float32 // N per unit of input
 	ShipTorque         float32 // N·m per unit of input
 	ShipLinearDamping  float32
 	ShipAngularDamping float32
+
+	// Rate-loop terms the open-loop controller had no way to express. Both default to
+	// zero, which reproduces it exactly; see DefaultTuning.
+	ShipRateKI float32 // N·m per rad of accumulated rate error
+	ShipRateKD float32 // N·m per rad/s² of measured rate change
+
+	// Input shaping, applied before input becomes a rate.
+	ShipInputDeadzone float32 // fraction of stick travel ignored around centre
+	ShipInputExponent float32 // 1 = linear; higher favours fine control near centre
 
 	// Salvage fragility.
 	SalvageDamageThreshold float32 // m/s below which impacts are harmless
@@ -53,6 +65,10 @@ const (
 	ParamShipTorque         uint16 = 0x0011
 	ParamShipLinearDamping  uint16 = 0x0012
 	ParamShipAngularDamping uint16 = 0x0013
+	ParamShipRateKI         uint16 = 0x0014
+	ParamShipRateKD         uint16 = 0x0015
+	ParamShipInputDeadzone  uint16 = 0x0016
+	ParamShipInputExponent  uint16 = 0x0017
 
 	ParamSalvageDamageThreshold uint16 = 0x0020
 	ParamSalvageDamageScale     uint16 = 0x0021
@@ -103,9 +119,36 @@ var paramDefs = []paramDef{
 	{ParamShipLinearDamping, "ship.linear_damping", 0, 5,
 		func(t *Tuning) float32 { return t.ShipLinearDamping },
 		func(t *Tuning, v float32) { t.ShipLinearDamping = v }},
-	{ParamShipAngularDamping, "ship.angular_damping", 0, 3000,
+	// Minimum is 1 rather than 0 because this is now the rate loop's proportional gain,
+	// and a gain of zero is a ship that cannot turn at all. Zero was never a usable
+	// setting — under the open-loop controller it was the ship that never *stopped*
+	// turning — so nothing is lost by closing the hole.
+	{ParamShipAngularDamping, "ship.angular_damping", 1, 3000,
 		func(t *Tuning) float32 { return t.ShipAngularDamping },
 		func(t *Tuning, v float32) { t.ShipAngularDamping = v }},
+	{ParamShipRateKI, "ship.rate_ki", 0, 2000,
+		func(t *Tuning) float32 { return t.ShipRateKI },
+		func(t *Tuning, v float32) { t.ShipRateKI = v }},
+	// Capped well below where the loop goes unstable, because a slider that can diverge
+	// will eventually be dragged there.
+	//
+	// The D term is -(kd/dt)·Δω, so at a fixed 30 Hz the rate recurrence is
+	// ω⁺ = (1-a-b)ω + b·ω⁻ + a·ω_set, with a = dt·kp/I and b = kd/I. Its roots leave the
+	// unit circle at b ≈ 1 - a/2, which for the ship's I = 0.4·m·r² = 192 kg·m² and the
+	// default kp is kd ≈ 177: past that the ship's turn rate oscillates and grows without
+	// limit. This maximum is I/2, leaving most of the margin intact.
+	//
+	// The bound moves with ShipMass, ShipRadius and TickHz — see
+	// TestRateDerivativeIsStableAcrossItsWholeRange, which fails if it drifts past this.
+	{ParamShipRateKD, "ship.rate_kd", 0, 96,
+		func(t *Tuning) float32 { return t.ShipRateKD },
+		func(t *Tuning, v float32) { t.ShipRateKD = v }},
+	{ParamShipInputDeadzone, "ship.input_deadzone", 0, 0.5,
+		func(t *Tuning) float32 { return t.ShipInputDeadzone },
+		func(t *Tuning, v float32) { t.ShipInputDeadzone = v }},
+	{ParamShipInputExponent, "ship.input_exponent", 1, 3,
+		func(t *Tuning) float32 { return t.ShipInputExponent },
+		func(t *Tuning, v float32) { t.ShipInputExponent = v }},
 
 	{ParamSalvageDamageThreshold, "salvage.damage_threshold", 0, 50,
 		func(t *Tuning) float32 { return t.SalvageDamageThreshold },
@@ -162,6 +205,36 @@ func DefaultTuning() *Tuning {
 		ShipLinearDamping:  0.35,
 		ShipAngularDamping: 900,
 
+		// Zero on purpose. Moving rotation onto the ART_OF_FLIGHT rate loop was meant to
+		// change what the controller *can* express, not what the ship currently feels
+		// like, and at ki = kd = 0 the new loop is the old arithmetic exactly (see
+		// Sim.controlShip). These are the knobs that were not previously reachable:
+		//
+		//   ship.rate_kd — the useful one, though not for the reason a D term usually is.
+		//     It resists *change* in turn rate, which is virtual rotational inertia: the
+		//     ship feels heavier, winds up and down more gradually, and gets thrown around
+		//     less by an impact. Note it does not exist to cure overshoot — the rate
+		//     loop's plant is first-order (torque is angular acceleration, and the body's
+		//     own angular damping is zeroed), so the P term alone cannot overshoot the
+		//     rate it was asked for. Steady state is unchanged whatever this is set to;
+		//     only the approach moves. Start around 60 for the 192 kg·m² ship.
+		//   ship.rate_ki — leave it alone for now, and know why. An integral term earns
+		//     its keep against a *sustained* torque disturbance, and this game has none:
+		//     body angular damping is zeroed, collisions are impulsive, and the grab
+		//     reaction is applied as a pure force with no torque (grab.go). The P term
+		//     already reaches the commanded rate exactly. It is wired up because it is
+		//     one slider away from mattering the moment that stops being true — an
+		//     off-centre hold point, or asymmetric thrust from a damaged hull — and
+		//     because the alternative was pretending the library's PID is a P.
+		ShipRateKI: 0,
+		ShipRateKD: 0,
+
+		// Also feel-neutral: no deadzone, linear curve. The client already smooths mouse
+		// input (client/controls.py), so a deadzone here would only eat fine aim; it
+		// exists for gamepad drift if a stick is ever bound.
+		ShipInputDeadzone: 0,
+		ShipInputExponent: 1,
+
 		SalvageDamageThreshold: 12,
 		SalvageDamageScale:     0.04,
 	}
@@ -182,6 +255,10 @@ func (t *Tuning) Snapshot() Tuning {
 		ShipTorque:             t.ShipTorque,
 		ShipLinearDamping:      t.ShipLinearDamping,
 		ShipAngularDamping:     t.ShipAngularDamping,
+		ShipRateKI:             t.ShipRateKI,
+		ShipRateKD:             t.ShipRateKD,
+		ShipInputDeadzone:      t.ShipInputDeadzone,
+		ShipInputExponent:      t.ShipInputExponent,
 		SalvageDamageThreshold: t.SalvageDamageThreshold,
 		SalvageDamageScale:     t.SalvageDamageScale,
 	}

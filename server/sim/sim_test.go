@@ -170,6 +170,126 @@ func TestShipTurnsAtAUsableRateAndSettles(t *testing.T) {
 	}
 }
 
+// Rotation runs through package flight, which maps the library's (pitch, yaw, roll) onto
+// this game's +X right / +Y forward / +Z up body frame. That mapping is invisible in a
+// diff and survives every test above — a yaw/roll swap still turns the ship, just about
+// the wrong axis — so it is pinned here through the real physics path.
+//
+// A freshly spawned ship has no rotation applied, so its body frame is the world frame and
+// the expected axis is world-space.
+func TestEachRotationInputTurnsAboutItsOwnAxis(t *testing.T) {
+	axes := []struct {
+		name  string
+		input Input
+		// axis picks the component of AngVel that should carry the rotation.
+		axis func(physics.Vec3) float32
+		rest func(physics.Vec3) (float32, float32)
+	}{
+		{"yaw about up", Input{Seq: 1, Yaw: 1},
+			func(v physics.Vec3) float32 { return v.Z },
+			func(v physics.Vec3) (float32, float32) { return v.X, v.Y }},
+		{"pitch about right", Input{Seq: 1, Pitch: 1},
+			func(v physics.Vec3) float32 { return v.X },
+			func(v physics.Vec3) (float32, float32) { return v.Y, v.Z }},
+		{"roll about the nose", Input{Seq: 1, Roll: 1},
+			func(v physics.Vec3) float32 { return v.Y },
+			func(v physics.Vec3) (float32, float32) { return v.X, v.Z }},
+	}
+
+	for _, a := range axes {
+		t.Run(a.name, func(t *testing.T) {
+			s := newBareSim(t, nil)
+			p := s.AddPlayer("pilot", 0)
+
+			s.SetInput(p.ID, a.input)
+			s.stepN(TickHz / 2)
+
+			b, _ := s.world.GetBody(p.Ship)
+			on := a.axis(b.AngVel)
+			off1, off2 := a.rest(b.AngVel)
+
+			if on < 0.5 {
+				t.Errorf("only %.3f rad/s about the intended axis", on)
+			}
+			if math.Abs(float64(off1)) > 0.01 || math.Abs(float64(off2)) > 0.01 {
+				t.Errorf("leaked %.3f / %.3f rad/s onto the other two axes — "+
+					"the pitch/yaw/roll mapping in package flight is crossed", off1, off2)
+			}
+		})
+	}
+}
+
+// ship.rate_kd is virtual rotational inertia: it resists change in turn rate, so the ship
+// winds up more gradually. What it must *not* do is change where the ship ends up — at a
+// steady rate there is no change to resist, so the top speed of a turn is the P term's
+// business alone. Both halves matter, and the second is the one a careless D term breaks.
+func TestRateDerivativeSlowsTheWindUpButNotTheTopRate(t *testing.T) {
+	spinUp := func(kd float32, ticks int) float32 {
+		s := newBareSim(t, nil)
+		s.Tuning.SetByID(ParamShipRateKD, kd)
+		p := s.AddPlayer("pilot", 0)
+
+		s.SetInput(p.ID, Input{Seq: 1, Yaw: 1})
+		s.stepN(ticks)
+
+		b, _ := s.world.GetBody(p.Ship)
+		return b.AngVel.Len()
+	}
+
+	const kd = 90 // a realistic setting, and inside ship.rate_kd's range
+
+	// Two ticks in, the damped ship must still be behind the undamped one.
+	quick, damped := spinUp(0, 2), spinUp(kd, 2)
+	t.Logf("after 2 ticks: kd=0 %.3f rad/s, kd=%v %.3f rad/s", quick, kd, damped)
+	if damped >= quick {
+		t.Errorf("kd=%v reached %.3f rad/s against kd=0's %.3f — "+
+			"the derivative is not resisting the wind-up", kd, damped, quick)
+	}
+
+	// Given time, both settle on the same rate.
+	quickTop, dampedTop := spinUp(0, TickHz*4), spinUp(kd, TickHz*4)
+	t.Logf("after 4 s: kd=0 %.3f rad/s, kd=%v %.3f rad/s", quickTop, kd, dampedTop)
+	if math.Abs(float64(quickTop-dampedTop)) > 0.02 {
+		t.Errorf("settled at %.3f rad/s with kd=%v against %.3f with kd=0 — "+
+			"kd is moving the top turn rate, which is ship.torque's job",
+			dampedTop, kd, quickTop)
+	}
+}
+
+// A dev-console slider that can destabilise the ship is a trap, and this one can: the D
+// term is divided by dt, so at 30 Hz a large kd makes the discrete rate loop oscillate and
+// diverge rather than damp. ship.rate_kd's maximum is picked to sit below that threshold
+// for the ship's moment of inertia — see the derivation in tuning.go — and the threshold
+// moves if ShipMass, ShipRadius or TickHz ever change.
+//
+// So this walks the whole published range instead of trusting the arithmetic.
+func TestRateDerivativeIsStableAcrossItsWholeRange(t *testing.T) {
+	def, ok := paramByID[ParamShipRateKD]
+	if !ok {
+		t.Fatal("ship.rate_kd is not in paramDefs")
+	}
+
+	// Full input for four seconds is long enough for divergence to be unmistakable, and
+	// the settled rate is bounded by ship.torque/ship.angular_damping ≈ 1.56 rad/s.
+	for _, kd := range []float32{def.Min, def.Max / 4, def.Max / 2, def.Max} {
+		s := newBareSim(t, nil)
+		s.Tuning.SetByID(ParamShipRateKD, kd)
+		p := s.AddPlayer("pilot", 0)
+
+		s.SetInput(p.ID, Input{Seq: 1, Yaw: 1})
+		s.stepN(TickHz * 4)
+
+		b, _ := s.world.GetBody(p.Ship)
+		rate := b.AngVel.Len()
+		t.Logf("kd=%-5v settled at %.3f rad/s", kd, rate)
+
+		if math.IsNaN(float64(rate)) || rate > 4.0 {
+			t.Errorf("kd=%v diverged to %v rad/s — the rate loop is unstable inside "+
+				"ship.rate_kd's own range (max %v)", kd, rate, def.Max)
+		}
+	}
+}
+
 func TestStaleInputIsIgnored(t *testing.T) {
 	s := newBareSim(t, nil)
 	p := s.AddPlayer("pilot", 0)
@@ -672,12 +792,18 @@ func TestShipsBounceOffMothership(t *testing.T) {
 // Bouncing off a fast approach is easy; the failure mode that matters is grinding
 // slowly against it under continuous thrust until you creep through the shell.
 func TestCannotFlyInsideMothership(t *testing.T) {
-	// Against the COLLIDER, not the hull the client draws — they are deliberately
-	// different sizes, and this test used to hard-code 30 for both. Physics can only
-	// express spheres, so the collider is the largest one that fits inside a flattened
-	// saucer; flying inside the drawn rim is the accepted cost of nothing invisible being
-	// solid. See MothershipColliderRadius.
-	const hull = MothershipColliderRadius
+	// The collider is now a flat cylinder matching the drawn saucer, so the two are the
+	// same size in the plane and this can assert against the *hull* rather than against a
+	// shrunken stand-in for it.
+	//
+	// It used to check MothershipColliderRadius — 12.6 m, the largest sphere that fits
+	// inside a flattened saucer — because the physics bridge could only resolve
+	// sphere-sphere contacts. Flying 17 m inside the drawn rim was the accepted cost of
+	// nothing invisible being solid. Both compromises are gone; see MothershipHalfHeight.
+	//
+	// The approach below is along Y with the ship at the station's own height, so what it
+	// meets is the cylinder's rim at MothershipRadius.
+	const hull = MothershipRadius
 	const minGap = hull + ShipRadius - 1.5
 
 	// Drives with real thrust input, the way a player does. Forcing velocity directly
@@ -716,6 +842,57 @@ func TestCannotFlyInsideMothership(t *testing.T) {
 			t.Errorf("%s put the ship %.1f m from the mothership centre — it is "+
 				"penetrating the collider", label, closest)
 		}
+	}
+}
+
+// The other half of the station's shape, and the one a previous fix was specifically
+// about: there must be nothing solid above the saucer. A sphere collider big enough to make
+// the rim solid also put ~17 m of invisible wall over the dome, which you hit while flying
+// home and — once impacts did damage by speed — died to.
+//
+// The cylinder gets both. This flies straight over the top, right across the centre, and
+// asserts the crossing happens at all and costs nothing.
+func TestCanFlyOverTheMothership(t *testing.T) {
+	s := newBareSim(t, nil)
+	p := s.AddPlayer("pilot", 0)
+
+	home := s.homeOf(p)
+
+	// Clear of the saucer's 12.6 m half-height plus the ship's own radius, but well inside
+	// the 30 m the old sphere would have made solid.
+	const alt = MothershipHalfHeight + ShipRadius + 4
+
+	start := home.Add(physics.Vec3{X: 0, Y: -70, Z: alt})
+	s.world.SetPosition(p.Ship, start)
+	s.world.SetVelocity(p.Ship, physics.Vec3{})
+	s.stepN(1)
+
+	before := s.objects[p.Ship].Health
+
+	// Nose along +Y, straight over the dome.
+	s.SetInput(p.ID, Input{Seq: 1, ThrustFwd: 1})
+
+	crossed := false
+	for i := 0; i < 900; i++ {
+		s.stepN(1)
+		b, _ := s.world.GetBody(p.Ship)
+		// Past the far side of the hull, still at altitude: it flew over.
+		if b.Pos.Y > home.Y+MothershipRadius {
+			crossed = true
+			break
+		}
+	}
+
+	b, _ := s.world.GetBody(p.Ship)
+	t.Logf("ended %.1f m from centre at Z offset %.1f", b.Pos.DistTo(home), b.Pos.Z-home.Z)
+
+	if !crossed {
+		t.Errorf("could not fly over the station at %.1f m altitude — it stalled at "+
+			"%+v. There is something solid above the saucer again", float32(alt), b.Pos)
+	}
+	if after := s.objects[p.Ship].Health; after < before {
+		t.Errorf("flying over the station cost %v health; the hull above the saucer is "+
+			"solid again", before-after)
 	}
 }
 

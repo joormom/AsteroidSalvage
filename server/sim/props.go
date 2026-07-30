@@ -110,6 +110,60 @@ const (
 	centrepieceKeepOut = 60.0
 )
 
+/*============================================================================
+ * Collider shapes
+ *
+ * A prop's model is built at unit radius and scaled by the radius the server reports, so
+ * the collider has to match the *model*, not a ball around it. Two of the four are nowhere
+ * near spherical, and a sphere around them was solid a long way out from anything you can
+ * see — you died against nothing, which is the worst kind of collision bug because there is
+ * no way for a pilot to learn it.
+ *
+ * These half-extents were measured off the real models (client/props.py) rather than
+ * estimated, by building each one and taking its tight bounds:
+ *
+ *   battlestation   X 1.03  Y 1.02  Z 1.00   a ball; a sphere is already right
+ *   capital wreck   X 0.55  Y 1.33  Z 0.31   long on Y, and only a third as tall
+ *   planet chunk    X 1.12  Y 1.08  Z 1.10   a ball
+ *   station ruin    X 0.96  Y 1.04  Z 0.70   a disc, and Z is mostly a thin mast
+ *
+ * Where a shape is chosen, it is deliberately biased *inward*. A collider slightly smaller
+ * than the model means clipping a wingtip without damage, which nobody notices; slightly
+ * larger means dying to empty space, which is the bug being fixed.
+ *===========================================================================*/
+
+// propCollider returns the physics shape for one prop kind at the given radius, and spawns
+// it. Kept together so the shape passed to physics and the shape recorded for the ray test
+// cannot drift apart.
+func (s *Sim) spawnPropBody(kind PropKind, radius float32, pos physics.Vec3) (physics.EntityID, Collider) {
+	switch kind {
+	case PropCapitalWreck:
+		// A capsule down the spine. Radius 0.40 sits between the 0.55 wings and the 0.31
+		// hull height: the wingtips are not solid, and only 0.09 of collider stands above
+		// the hull, against the 0.69 a sphere had. Half-height 0.93 puts the rounded ends
+		// at 1.33, exactly the model's reach.
+		//
+		// AxisY needs no rotation: the model is built long on Y and lagrange's capsules run
+		// along Y too.
+		r, hh := radius*0.40, radius*0.93
+		e := s.world.SpawnCapsule(0, r, hh, physics.AxisY, pos)
+		return e, CapsuleCollider(r, hh, physics.AxisY)
+
+	case PropStationRuin:
+		// A flat disc for the ring. Half-height 0.25 covers the ring plating and the hub;
+		// the mast that reaches 0.70 is a thin spike and is left insubstantial rather than
+		// making the whole disc that thick.
+		r, hh := radius*0.96, radius*0.25
+		e := s.world.SpawnCylinder(0, r, hh, physics.AxisZ, pos)
+		return e, CylinderCollider(r, hh, physics.AxisZ)
+
+	default:
+		// Battlestation and planet chunk both fill their unit sphere, so the sphere was
+		// never the problem for them.
+		return s.world.SpawnSphere(0, radius, pos), SphereCollider(radius)
+	}
+}
+
 // Centrepiece returns the map's landmark, or nil if this map has none.
 func (s *Sim) Centrepiece() *Object {
 	if s.centrepiece == 0 {
@@ -130,14 +184,14 @@ func (s *Sim) spawnCentrepiece() {
 		Z: (s.rng.Float32()*2 - 1) * centrepieceDrift * 0.4,
 	}
 
-	e := s.world.SpawnSphere(0, radius, pos)
+	e, col := s.spawnPropBody(spec.Kind, radius, pos)
 	if e == 0 {
 		return
 	}
 	s.world.SetMaterial(e, ShipRestitution, 0.25)
 
 	s.objects[e] = &Object{
-		Entity: e, Kind: KindProp, Radius: radius,
+		Entity: e, Kind: KindProp, Radius: radius, Collider: col,
 		Tier: Tier(spec.Kind), Team: NoTeam, Integrity: 1,
 	}
 	s.centrepiece = e
@@ -187,14 +241,14 @@ func (s *Sim) spawnProps() {
 			continue // the map is full; eight landmarks is still a map
 		}
 
-		e := s.world.SpawnSphere(0, radius, pos) // mass 0: static, like a mothership
+		e, col := s.spawnPropBody(spec.Kind, radius, pos) // mass 0: static, like a mothership
 		if e == 0 {
 			return // storage full
 		}
 		s.world.SetMaterial(e, ShipRestitution, 0.25)
 
 		s.objects[e] = &Object{
-			Entity: e, Kind: KindProp, Radius: radius,
+			Entity: e, Kind: KindProp, Radius: radius, Collider: col,
 			Tier: Tier(spec.Kind), Team: NoTeam, Integrity: 1,
 			// No health at all: MaxHealth 0 is what tells the snapshot encoder this is
 			// not a thing with a hull bar, and what keeps it off the shootable list.

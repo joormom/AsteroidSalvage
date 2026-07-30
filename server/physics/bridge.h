@@ -65,14 +65,62 @@ void      ag_world_free(ag_world* w);
 
 /* --- entities --- */
 
+/* Shape ids, matching lg_shape_type_t (collider.h:20) so the two cannot drift apart
+ * without this comment being wrong in an obvious place. */
+typedef enum {
+    AG_SHAPE_SPHERE = 0,
+    AG_SHAPE_BOX = 1,
+    AG_SHAPE_CAPSULE = 2,
+    AG_SHAPE_CYLINDER = 3,
+    AG_SHAPE_PLANE = 4
+} ag_shape;
+
+/* Which body-local axis a capsule or cylinder runs along.
+ *
+ * AG_AXIS_Y is lagrange's own convention and the cheaper one: lg_collider_inertia builds
+ * its tensor around Y too (collider.h:159, 167), so shape and inertia agree with no
+ * fixing up.
+ *
+ * AG_AXIS_Z exists because the collider's axis cannot always be chosen by rotating the
+ * body. The client applies each snapshot's rotation to the model it draws
+ * (client/render.py:341), so spinning a body to aim its collider also spins what the
+ * player sees — a saucer or a ring station laid out in its local XY plane would visibly
+ * tip onto its side. This lets the collider point along +Z while the body itself stays
+ * upright. Inertia is swizzled to match, so a dynamic body still resists spin about the
+ * axis it is actually long along. */
+typedef enum {
+    AG_AXIS_Y = 0,
+    AG_AXIS_Z = 1
+} ag_axis;
+
 /* Returns 0 (LG_ENTITY_INVALID) if storage is full. mass <= 0 creates a static body.
- * Inertia is derived from the collider so torque behaves correctly. */
+ * Inertia is derived from the collider so torque behaves correctly.
+ *
+ * Capsules and cylinders take a HALF height, like boxes take half extents, and run along
+ * whichever body-local axis `axis` names. ag_set_rotation still orients the body on top of
+ * that.
+ *
+ * Not every pair of shapes can collide — lagrange has no routine for capsule/box,
+ * cylinder/cylinder and a few others. Ask ag_collider_pair_supported before relying on a
+ * pairing; an unsupported pair passes through one another in silence. */
 uint64_t ag_spawn_sphere(ag_world* w, float mass, float radius,
                          float px, float py, float pz);
 uint64_t ag_spawn_box(ag_world* w, float mass, float hx, float hy, float hz,
                       float px, float py, float pz);
+uint64_t ag_spawn_capsule(ag_world* w, float mass, float radius, float half_height,
+                          int axis, float px, float py, float pz);
+uint64_t ag_spawn_cylinder(ag_world* w, float mass, float radius, float half_height,
+                           int axis, float px, float py, float pz);
+
+/* An infinite half-space, always static. `distance` is the offset from the origin along
+ * the normal; solid on the side the normal points away from. */
+uint64_t ag_spawn_plane(ag_world* w, float nx, float ny, float nz, float distance);
+
 void     ag_despawn(ag_world* w, uint64_t entity);
 size_t   ag_body_count(const ag_world* w);
+
+/* Whether ag_narrow_phase implements this pair. Both arguments are ag_shape values. */
+bool ag_collider_pair_supported(int shape_a, int shape_b);
 
 /* --- per-tick bulk operations (the hot path) --- */
 
@@ -95,6 +143,10 @@ size_t ag_drain_collisions(ag_world* w, ag_collision* out, size_t max);
 
 bool ag_get_body(ag_world* w, uint64_t entity, ag_body_state* out);
 void ag_set_position(ag_world* w, uint64_t entity, float x, float y, float z);
+
+/* Orient a body. Matters for boxes, capsules and cylinders — a sphere does not care, and
+ * before non-sphere colliders existed nothing set this. Normalised internally. */
+void ag_set_rotation(ag_world* w, uint64_t entity, float x, float y, float z, float wq);
 void ag_set_velocity(ag_world* w, uint64_t entity, float x, float y, float z);
 void ag_set_damping(ag_world* w, uint64_t entity, float linear, float angular);
 void ag_set_sleep_allowed(ag_world* w, uint64_t entity, bool allowed);

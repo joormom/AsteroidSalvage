@@ -946,7 +946,15 @@ PARAMS: list[tuple[int, str, float, float]] = [
     (0x0010, "ship.thrust", 0.0, 5000.0),
     (0x0011, "ship.torque", 0.0, 6000.0),
     (0x0012, "ship.linear_damping", 0.0, 5.0),
-    (0x0013, "ship.angular_damping", 0.0, 3000.0),
+    # Minimum 1, not 0: this is the rate loop's proportional gain, and a gain of zero is a
+    # ship that cannot turn. See sim/tuning.go.
+    (0x0013, "ship.angular_damping", 1.0, 3000.0),
+    (0x0014, "ship.rate_ki", 0.0, 2000.0),
+    # Capped where it is because a larger value makes the 30 Hz rate loop diverge rather
+    # than damp — the derivation is in sim/tuning.go.
+    (0x0015, "ship.rate_kd", 0.0, 96.0),
+    (0x0016, "ship.input_deadzone", 0.0, 0.5),
+    (0x0017, "ship.input_exponent", 1.0, 3.0),
     (0x0020, "salvage.damage_threshold", 0.0, 50.0),
     (0x0021, "salvage.damage_scale", 0.0, 1.0),
 ]
@@ -958,10 +966,20 @@ PARAM_DEFAULTS: dict[str, float] = {
     "grab.hold_distance": 6.0,
     "grab.reaction_scale": 1.0,
     "grab.range": 15.0,
-    "ship.thrust": 900.0,
+    # ship.thrust and salvage.damage_threshold had drifted from the server's own defaults
+    # (900 and 6, against sim.DefaultTuning's 1800 and 12), which made the console's
+    # "reset to defaults" button quietly push a different game than a fresh server runs.
+    "ship.thrust": 1800.0,
     "ship.torque": 1400.0,
     "ship.linear_damping": 0.35,
     "ship.angular_damping": 900.0,
-    "salvage.damage_threshold": 6.0,
+    # Zero and linear: the rate loop reproduces the open-loop controller exactly at these,
+    # so the defaults change nothing about how the ship flies. See sim.DefaultTuning for
+    # what each one buys.
+    "ship.rate_ki": 0.0,
+    "ship.rate_kd": 0.0,
+    "ship.input_deadzone": 0.0,
+    "ship.input_exponent": 1.0,
+    "salvage.damage_threshold": 12.0,
     "salvage.damage_scale": 0.04,
 }

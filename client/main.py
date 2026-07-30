@@ -587,7 +587,11 @@ class Game(ShowBase):
                               on_start_match=self._start_match,
                               on_leave_lobby=self._leave_game,
                               on_set_team=self._set_team,
-                              player_name=args.name,
+                              # self._args, not args: this block is a copy of the one in
+                              # __init__, where `args` is a parameter. Here it is not in
+                              # scope, and leaving a match raised NameError instead of
+                              # returning to the menu.
+                              player_name=self._args.name,
                               binds=self.binds, on_rebind=self.rebind,
                               on_settings_changed=self._save_settings)
 

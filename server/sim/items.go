@@ -372,7 +372,10 @@ func (s *Sim) spawnPickup() {
 	e := physics.EntityID(pickupEntityBase + s.nextPickupID)
 	s.objects[e] = &Object{
 		Entity: e, Kind: KindPickup, Tier: Tier(item), Radius: PickupRadius,
-		Team: NoTeam, Integrity: 1, Health: 1, MaxHealth: 1,
+		// No physics body at all, so this is only what a shot would test against — and
+		// nothing shoots a pickup. Set for consistency rather than for behaviour.
+		Collider: SphereCollider(PickupRadius),
+		Team:     NoTeam, Integrity: 1, Health: 1, MaxHealth: 1,
 	}
 	s.pickupPos[e] = pos
 }

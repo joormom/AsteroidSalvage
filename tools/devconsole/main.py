@@ -49,6 +49,10 @@ SHIP_PARAMS = {
     "ship.torque",
     "ship.linear_damping",
     "ship.angular_damping",
+    "ship.rate_ki",
+    "ship.rate_kd",
+    "ship.input_deadzone",
+    "ship.input_exponent",
 }
 
 
@@ -92,6 +96,12 @@ class Console:
 
         imgui.separator_text("Ship handling")
         self._sliders(SHIP_PARAMS)
+        imgui.text_wrapped(
+            "Rotation is a rate loop (ART_OF_FLIGHT): torque and angular_damping are the "
+            "turn rate you ask for and the gain that holds it. rate_kd adds virtual "
+            "rotational inertia — a heavier ship, less thrown by impacts. rate_ki does "
+            "nothing until something applies a sustained torque, which nothing yet does."
+        )
 
         imgui.separator_text("Salvage fragility")
         self._sliders(

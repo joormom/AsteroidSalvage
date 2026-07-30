@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 
+	"asteroidsalvage/flight"
 	"asteroidsalvage/physics"
 )
 
@@ -36,23 +37,23 @@ const (
 	// Config.DepositRadius.
 	MothershipRadius = 30.0
 
-	// MothershipColliderRadius is the sphere the physics world actually uses, and it is
-	// deliberately much smaller. **Stopgap.**
+	// MothershipHalfHeight is how thick the saucer is, and with MothershipRadius it is the
+	// whole collider: a flat cylinder that matches the hull the client draws.
 	//
-	// The station model is a flattened saucer — an ellipsoid 30 m across and 12.6 m tall —
-	// but ag_resolve_collisions in bridge.c only resolves sphere-sphere contacts, so a
-	// collider can only ever be a sphere. At the full 30 m that left roughly 17 m of solid
-	// nothing above and below the saucer: you flew over your own station, hit an invisible
-	// wall, and once collisions started doing damage by speed that killed you.
+	// The model's hull blob is scaled (1.00, 1.00, 0.42) at unit radius
+	// (client/shipmodel.py), so at 30 m across it stands 12.6 m from the equator to the
+	// dome — which is where this number comes from rather than being chosen.
 	//
-	// 12.6 m is the largest sphere that fits entirely inside the visible hull, so nothing
-	// invisible can be hit any more. The cost is the opposite error, and a cosmetic one:
-	// the outer rim of the saucer is now flown through rather than bounced off.
+	// This replaced a 12.6 m *sphere*, which was a stopgap for the era when the physics
+	// bridge could only resolve sphere-sphere contacts. A 30 m sphere left roughly 17 m of
+	// solid nothing above and below the saucer — you flew over your own station, hit an
+	// invisible wall, and once impacts did damage by speed that killed you — so it was shrunk
+	// to the largest sphere that fits inside the hull, trading the invisible ceiling for a
+	// rim you flew straight through. The cylinder needs neither compromise.
 	//
-	// The real fix is a ring station — a circle of sphere colliders matching a rebuilt
-	// model, with the rim solid and the middle open — which needs the model, the colliders
-	// and the parenting of shots and rams all changed together.
-	MothershipColliderRadius = 12.6
+	// Bolts test against the same cylinder, not a sphere of MothershipRadius, so a shot
+	// aimed over the dome now sails past exactly where a ship would. See collider.go.
+	MothershipHalfHeight = 12.6
 
 	// MothershipRing is how far each team's mothership sits from the centre. Far
 	// enough apart that a team's home is defensible and worth flying back to, close
@@ -165,7 +166,16 @@ type Object struct {
 	Entity physics.EntityID
 	Kind   Kind
 	Tier   Tier
+
+	// Radius is what everything *outside* physics uses: the client scales the model by it,
+	// the HUD ranges off it, and spawn placement keeps clear of it. It is the object's
+	// overall size, not necessarily the shape it collides as.
 	Radius float32
+
+	// Collider is the shape the physics world actually uses, so the bolt ray test can
+	// agree with it. Zero value is not valid — everything is spawned with at least
+	// SphereCollider(Radius). See collider.go for why the two are separate.
+	Collider Collider
 
 	// Team owns this object: which crew a ship belongs to, or which mothership this is.
 	// 0xFF for neutral things like asteroids.
@@ -257,6 +267,12 @@ type Player struct {
 
 	input   Input
 	lastSeq uint32
+
+	// rate is this ship's attitude rate loop. Per player, and not a pointer, because a
+	// PID is state: it carries an integrator and a memory of last tick's rate, which is
+	// the whole reason it can hold a turn against something pushing back. Reset on
+	// respawn and round start — see resetShip.
+	rate flight.Controller
 
 	// grabCooldown blocks re-acquisition for a few ticks after cargo breaks free, so
 	// overreaching still costs you something even though the grab button is held down.
@@ -561,9 +577,15 @@ func New(cfg Config) (*Sim, error) {
 		team := uint8(i)
 		pos := s.mothershipPos(team, teamCount)
 
-		// Static: a destination, not a physics participant. The collider is smaller than
-		// the hull the client draws — see MothershipColliderRadius.
-		e := w.SpawnSphere(0, MothershipColliderRadius, pos)
+		// Static: a destination, not a physics participant.
+		//
+		// A flat cylinder, which is the saucer: the client's hull blob is scaled
+		// (1.00, 1.00, 0.42) at unit radius (client/shipmodel.py), so at MothershipRadius
+		// it is 30 m across and 12.6 m half-height, and that is exactly this collider.
+		// AxisZ because the disc lies in the body's XY plane — rotating the body to aim a
+		// default AxisY cylinder would tip the visible model on its side, since the client
+		// draws every body at its snapshot rotation.
+		e := w.SpawnCylinder(0, MothershipRadius, MothershipHalfHeight, physics.AxisZ, pos)
 		// Without this the mothership keeps lagrange's default 0.3 restitution, and
 		// since contacts take the minimum, every ship that touched it barely bounced.
 		w.SetMaterial(e, ShipRestitution, 0.25)
@@ -571,7 +593,9 @@ func New(cfg Config) (*Sim, error) {
 		s.motherships[team] = e
 		s.objects[e] = &Object{
 			Entity: e, Kind: KindMothership, Radius: MothershipRadius,
-			Team: team, Integrity: 1,
+			// The saucer, matching the cylinder spawned above so shots stop where ships do.
+			Collider: CylinderCollider(MothershipRadius, MothershipHalfHeight, physics.AxisZ),
+			Team:     team, Integrity: 1,
 			Health: MothershipMaxHealth, MaxHealth: MothershipMaxHealth,
 		}
 	}
@@ -754,7 +778,8 @@ func (s *Sim) AddPlayer(name string, teamPref uint8) *Player {
 	s.players[p.ID] = p
 	s.objects[ship] = &Object{
 		Entity: ship, Kind: KindShip, Radius: ShipRadius, Integrity: 1,
-		Team: team, Health: ShipMaxHealth, MaxHealth: ShipMaxHealth,
+		Collider: SphereCollider(ShipRadius),
+		Team:     team, Health: ShipMaxHealth, MaxHealth: ShipMaxHealth,
 	}
 	s.teams[team].Members++
 
@@ -935,7 +960,8 @@ func (s *Sim) SpawnWave() {
 
 		s.objects[e] = &Object{
 			Entity: e, Kind: KindAsteroid, Tier: tier, Radius: radius,
-			Team: NoTeam, Value: value, Integrity: 1, RequiredBeams: required,
+			Collider: SphereCollider(radius),
+			Team:     NoTeam, Value: value, Integrity: 1, RequiredBeams: required,
 			Health: HealthFor(tier, radius), MaxHealth: HealthFor(tier, radius),
 		}
 	}
@@ -1111,6 +1137,21 @@ func (s *Sim) addForce(e physics.EntityID, force, torque physics.Vec3) {
 }
 
 // controlShip converts 6DOF input into world-space force and torque.
+//
+// Thrust is open-loop: input scales a force along the ship's own axes, which is what a
+// thruster does. Rotation is not — it runs through the ART_OF_FLIGHT rate loop in package
+// flight, where input names a *turn rate* and a PID finds the torque that holds it.
+//
+// That is a smaller change than it sounds, because the hand-rolled controller this
+// replaced was already a proportional rate loop wearing a disguise:
+//
+//	torque = T·u − c·ω  =  c·(T/c·u − ω)
+//
+// which is a P controller with kp = c and a setpoint of (T/c)·u. So ship.torque and
+// ship.angular_damping are fed in as exactly that — a rate setpoint and a gain — and at
+// ki = kd = 0 the ship flies identically to before, down to the arithmetic. What is new is
+// that ki and kd are now sayable at all, and that the loop runs in the body frame, where a
+// per-axis integrator is a meaningful thing to have.
 func (s *Sim) controlShip(p *Player, tune *Tuning) {
 	st, ok := s.states[p.Ship]
 	if !ok {
@@ -1143,13 +1184,30 @@ func (s *Sim) controlShip(p *Player, tune *Tuning) {
 	}
 	force = force.Add(st.Vel.Scale(-damp * st.Mass))
 
-	torque := up.Scale(in.Yaw).
-		Add(right.Scale(in.Pitch)).
-		Add(fwd.Scale(in.Roll)).
-		Scale(tune.ShipTorque)
+	// Top turn rate and responsiveness stay expressed as torque and damping, because that
+	// is what the console sliders, config/feel.toml and shared/protocol.md all already
+	// hold, and what the tuning notes there reason about. ShipAngularDamping cannot be
+	// zero — its slider minimum is 1 — so this does not divide by it blindly.
+	params := flight.Params{
+		KP:          tune.ShipAngularDamping,
+		KI:          tune.ShipRateKI,
+		KD:          tune.ShipRateKD,
+		MaxRate:     tune.ShipTorque / tune.ShipAngularDamping,
+		TorqueScale: tune.ShipTorque,
+		Deadzone:    tune.ShipInputDeadzone,
+		Exponent:    tune.ShipInputExponent,
+		// The pilot's input is a mouse, so the setpoint moves every frame; the derivative
+		// has to watch the ship instead or every mouse jump becomes a torque spike.
+		DerivativeOnMeasurement: true,
+	}
 
-	// Angular damping keeps the ship from spinning forever after a nudge.
-	torque = torque.Add(st.AngVel.Scale(-tune.ShipAngularDamping))
+	// The loop integrates per body axis, so it needs the rate in the body frame — the
+	// snapshot's AngVel is world-frame. The conjugate rotation carries world into body,
+	// and rotating the result back out again carries the torque to the frame
+	// ApplyForces expects.
+	bodyRate := rot.Conjugate().Rotate(st.AngVel)
+	torque := rot.Rotate(
+		p.rate.Update(&params, in.Pitch, in.Yaw, in.Roll, bodyRate, TickDuration))
 
 	s.addForce(p.Ship, force, torque)
 }
