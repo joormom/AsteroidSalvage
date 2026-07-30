@@ -375,6 +375,12 @@ func (s *Sim) resetShip(p *Player) {
 	s.world.SetPosition(p.Ship, pos)
 	s.world.SetVelocity(p.Ship, physicsZero)
 
+	// The rate loop's integrator is the one piece of ship state that is invisible, so it
+	// is the one most likely to be forgotten: a controller that spent the last second
+	// winding up against a rock it was carrying would spend the first second of the new
+	// life spending that wind-up on nothing.
+	p.rate.Reset()
+
 	// A new round is a clean slate: full hull, full charge. Carrying battle damage
 	// across an intermission would punish the team that had to fight for the last round.
 	if o, ok := s.objects[p.Ship]; ok {

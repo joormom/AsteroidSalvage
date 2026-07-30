@@ -121,21 +121,132 @@ func (w *World) SpawnSphere(mass, radius float32, pos Vec3) EntityID {
 		C.float(pos.X), C.float(pos.Y), C.float(pos.Z)))
 }
 
+// Shape identifies a collider's geometry. Used with PairSupported.
+type Shape int
+
+const (
+	ShapeSphere   Shape = C.AG_SHAPE_SPHERE
+	ShapeBox      Shape = C.AG_SHAPE_BOX
+	ShapeCapsule  Shape = C.AG_SHAPE_CAPSULE
+	ShapeCylinder Shape = C.AG_SHAPE_CYLINDER
+	ShapePlane    Shape = C.AG_SHAPE_PLANE
+)
+
+func (s Shape) String() string {
+	switch s {
+	case ShapeSphere:
+		return "sphere"
+	case ShapeBox:
+		return "box"
+	case ShapeCapsule:
+		return "capsule"
+	case ShapeCylinder:
+		return "cylinder"
+	case ShapePlane:
+		return "plane"
+	}
+	return "unknown"
+}
+
+// PairSupported reports whether two shapes can collide with each other.
+//
+// Not every pair is implemented: lagrange has no routine for capsule/box,
+// cylinder/cylinder, cylinder/box, plane/capsule or plane/plane, and an unsupported pair
+// passes through in silence rather than erroring. Check this before introducing a shape
+// that has to be solid against something specific.
+//
+// Every dynamic body in this game is a sphere, and sphere collides with all five, so the
+// gaps only bite if a non-sphere is ever given a mass.
+func PairSupported(a, b Shape) bool {
+	return bool(C.ag_collider_pair_supported(C.int(a), C.int(b)))
+}
+
 // SpawnBox adds a box body given its half-extents. mass <= 0 creates a static body.
 //
-// **A box does not collide with anything.** ag_resolve_collisions in bridge.c skips every
-// collider that is not LG_SHAPE_SPHERE, because lagrange's own narrow phase is bypassed
-// (its contact normals are inverted relative to its resolver) and the replacement only
-// implements sphere-sphere. A body spawned here will fall through the world silently,
-// which is a worse failure than a compile error — hence this note rather than removing it.
-//
-// Nothing in the game uses it. Anything that needs to be solid is a sphere, or a cluster
-// of them.
+// Boxes collide properly against spheres and planes, and honour their rotation — set it
+// with SetRotation. Box against box is the one gap: lagrange's routine for that pair is an
+// AABB overlap test that ignores both rotations, so it is only correct for axis-aligned
+// boxes. It costs nothing today because two boxes are always two static bodies, which the
+// resolver skips before it looks at shapes; giving a box a mass is what would expose it.
 func (w *World) SpawnBox(mass float32, half Vec3, pos Vec3) EntityID {
 	return EntityID(C.ag_spawn_box(w.w,
 		C.float(mass),
 		C.float(half.X), C.float(half.Y), C.float(half.Z),
 		C.float(pos.X), C.float(pos.Y), C.float(pos.Z)))
+}
+
+// Axis names the body-local axis a capsule or cylinder runs along.
+type Axis int
+
+const (
+	// AxisY is lagrange's own convention and the cheaper choice: its inertia tensor is
+	// built around Y too, so shape and spin resistance agree with nothing to fix up.
+	AxisY Axis = C.AG_AXIS_Y
+
+	// AxisZ is for a shape whose long axis has to be the game's up while the body itself
+	// stays unrotated. The client draws every body at its snapshot rotation
+	// (client/render.py:341), so orienting a collider by rotating the body also rotates
+	// the model — a saucer or ring station laid out in its local XY plane would visibly
+	// tip on its side. Inertia is swizzled to match.
+	AxisZ Axis = C.AG_AXIS_Z
+)
+
+func (a Axis) String() string {
+	if a == AxisZ {
+		return "Z"
+	}
+	return "Y"
+}
+
+// SpawnCapsule adds a capsule: a cylinder with hemispherical caps. halfHeight is the half
+// length of the straight section, so the total extent along the axis is
+// 2*(halfHeight+radius).
+//
+// axis picks which body-local axis it runs along; SetRotation still orients the body on top
+// of that. Prefer AxisY where the choice is free — see the Axis constants.
+//
+// This is the right shape for anything long and thin that a ship should slide along rather
+// than catch on — a girder, a strut, a wreck's spine. A sphere cluster approximates it at
+// several times the cost and with a bumpy surface.
+func (w *World) SpawnCapsule(mass, radius, halfHeight float32, axis Axis, pos Vec3) EntityID {
+	return EntityID(C.ag_spawn_capsule(w.w,
+		C.float(mass), C.float(radius), C.float(halfHeight), C.int(axis),
+		C.float(pos.X), C.float(pos.Y), C.float(pos.Z)))
+}
+
+// SpawnCylinder adds a flat-capped cylinder along the given body-local axis.
+//
+// A wide, shallow cylinder is the shape of a saucer or a disc — which is what makes it the
+// right collider for this game's station hulls, with AxisZ so the disc lies in the body's XY
+// plane the way the models do.
+//
+// Only sphere/cylinder is implemented, so a cylinder is for static scenery that ships and
+// rocks bounce off. Prefer a capsule where the flat caps do not matter: its contact is
+// smooth everywhere, which is kinder to the solver.
+func (w *World) SpawnCylinder(mass, radius, halfHeight float32, axis Axis, pos Vec3) EntityID {
+	return EntityID(C.ag_spawn_cylinder(w.w,
+		C.float(mass), C.float(radius), C.float(halfHeight), C.int(axis),
+		C.float(pos.X), C.float(pos.Y), C.float(pos.Z)))
+}
+
+// SpawnPlane adds an infinite static half-space. normal need not be unit length;
+// distance offsets it from the origin along that normal, and the solid side is the one the
+// normal points away from.
+//
+// Useful as an arena wall — a hard boundary that cannot be flown around, unlike a large
+// sphere.
+func (w *World) SpawnPlane(normal Vec3, distance float32) EntityID {
+	return EntityID(C.ag_spawn_plane(w.w,
+		C.float(normal.X), C.float(normal.Y), C.float(normal.Z), C.float(distance)))
+}
+
+// SetRotation orients a body. Cold path.
+//
+// Spheres do not care, which is why nothing called this before non-sphere colliders
+// existed. Boxes, capsules and cylinders all do.
+func (w *World) SetRotation(e EntityID, q Quat) {
+	C.ag_set_rotation(w.w, C.uint64_t(e),
+		C.float(q.X), C.float(q.Y), C.float(q.Z), C.float(q.W))
 }
 
 // Despawn removes an entity.

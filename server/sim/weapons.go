@@ -313,7 +313,8 @@ func (s *Sim) spawnFragments(st physics.BodyState, parentRadius float32, tier Ti
 
 		s.objects[e] = &Object{
 			Entity: e, Kind: KindAsteroid, Tier: tier, Radius: radius,
-			Team: NoTeam, Value: ValueFor(tier, radius), Integrity: 1,
+			Collider: SphereCollider(radius),
+			Team:     NoTeam, Value: ValueFor(tier, radius), Integrity: 1,
 			RequiredBeams: requiredBeamsFor(tier),
 			Health:        HealthFor(tier, radius),
 			MaxHealth:     HealthFor(tier, radius),

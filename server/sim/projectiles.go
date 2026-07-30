@@ -185,7 +185,10 @@ func (s *Sim) boltSweep(b *Bolt, from, to physics.Vec3) (physics.EntityID, physi
 		if !ok {
 			continue
 		}
-		if t, hit := raySphere(from, dir, st.Pos, o.Radius+b.Radius()); hit && t <= bestT {
+		// Against the object's real collider, not a sphere of Radius. For everything
+		// spherical those are the same test; for the scenery that is not, this is what stops
+		// a shot passing through solid hull or stopping against thin air. See collider.go.
+		if t, hit := o.Collider.Ray(from, dir, st.Pos, st.Rot, b.Radius()); hit && t <= bestT {
 			best, bestT = e, t
 		}
 	}

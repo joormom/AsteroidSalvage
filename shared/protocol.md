@@ -568,7 +568,11 @@ rather than rediscovered.
 | `0x0010` | `ship.thrust` | 1800.0 | 0–5000 |
 | `0x0011` | `ship.torque` | 1400.0 | 0–6000 |
 | `0x0012` | `ship.linear_damping` | 0.35 | 0–5 |
-| `0x0013` | `ship.angular_damping` | 900.0 | 0–3000 |
+| `0x0013` | `ship.angular_damping` | 900.0 | 1–3000 |
+| `0x0014` | `ship.rate_ki` | 0.0 | 0–2000 |
+| `0x0015` | `ship.rate_kd` | 0.0 | 0–96 |
+| `0x0016` | `ship.input_deadzone` | 0.0 | 0–0.5 |
+| `0x0017` | `ship.input_exponent` | 1.0 | 1–3 |
 | `0x0020` | `salvage.damage_threshold` | 12.0 | 0–50 |
 | `0x0021` | `salvage.damage_scale` | 0.04 | 0–1 |
 
@@ -580,6 +584,32 @@ asteroid *feel* heavy. `1.0` is physically correct; the tuned value may not be.
 than directly: top turn rate is `torque / angular_damping`, and responsiveness is
 `inertia / angular_damping` where the ship's inertia is `0.4·m·r²` = 192. Defaults give
 ~1.55 rad/s and a 0.21 s time constant.
+
+Ship rotation runs through the ART_OF_FLIGHT rate loop (`server/flight`): input names a
+turn rate and a PID per body axis finds the torque that holds it. The two parameters above
+are unchanged by that and still mean exactly what the paragraph above says — they reach the
+controller as its rate setpoint and its proportional gain, because the open-loop
+controller this replaced was already a P rate loop in disguise (`T·u − c·ω` is
+`c·(T/c·u − ω)`). At the default `rate_ki` and `rate_kd` of zero the two are the same
+arithmetic, which `flight.TestPOnlyLoopReproducesTheOpenLoopController` pins.
+
+`ship.angular_damping` has a minimum of 1 rather than 0 because it is now that
+proportional gain, and a gain of zero is a ship that cannot turn at all.
+
+`ship.rate_kd` is virtual rotational inertia — it resists *change* in turn rate, so the
+ship feels heavier and an impact throws it less. It does not cure overshoot: the plant is
+first-order, so the P term alone cannot overshoot the rate it was asked for. Its range
+stops at 96 because the D term is divided by `dt`, and past roughly 177 the 30 Hz loop
+oscillates and diverges instead of damping (derivation in `server/sim/tuning.go`).
+
+`ship.rate_ki` does nothing in the game as it stands: an integral term earns its keep
+against a *sustained* torque disturbance, and there is none — body angular damping is
+zeroed, collisions are impulsive, and the grab reaction is applied as a pure force with no
+torque. It is exposed because it is one slider away from mattering if that changes.
+
+`ship.input_deadzone` and `ship.input_exponent` shape input before it becomes a rate. Both
+are feel-neutral by default; the client already smooths mouse input, so a deadzone here
+would only eat fine aim. They exist for a gamepad stick, if one is ever bound.
 
 `salvage.damage_threshold` is in m/s and has to move with `ship.thrust`, because what
 matters is the fraction of top speed rather than the absolute number. It went 6 → 12 when

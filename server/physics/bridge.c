@@ -40,6 +40,20 @@ struct ag_world {
     size_t collision_count;
     size_t collisions_dropped;
 
+    /* Which local axis each capsule/cylinder runs along, as an ag_axis, indexed directly by
+     * entity id.
+     *
+     * A flat array is safe here because lagrange keeps ids small and bounded: they come
+     * from next_id++ or a free list with no version bits (world.h:199), and a fresh high id
+     * is only minted when the free list is empty — which means every id below it is live,
+     * and storage is capped at max_entities. So no id can exceed max_entities. Indexing is
+     * bounds-checked anyway, because relying on that reasoning without a guard is how it
+     * stops being true.
+     *
+     * Meaningless for other shapes, and left as AG_AXIS_Y for them. */
+    uint8_t* shape_axis;
+    size_t shape_axis_cap;
+
     double last_step_ms;
 };
 
@@ -74,31 +88,240 @@ static void ag_record_collision(ag_world* self, lg_entity_t a, lg_entity_t b, fl
 }
 
 /*============================================================================
+ * Narrow phase
+ *
+ * WHY THIS IS HERE INSTEAD OF lg_narrow_phase
+ * -------------------------------------------
+ * lagrange has the geometry for every pair this game could want — sphere, box, capsule,
+ * cylinder, plane — and that is the bulk of the work. What it does not have is a
+ * consistent answer to "which way does the contact normal point".
+ *
+ *   lg_collide_spheres        (sim.h:37)   delta = pos_b - pos_a          ->  A to B
+ *   lg_collide_sphere_box     (sim.h:131)  delta = sphere - closest_on_box ->  B to A
+ *   lg_collide_box_box        (sim.h:167)  sign from pos_a > pos_b         ->  B to A
+ *   lg_collide_sphere_capsule (sim.h:215)  delta = sphere - closest        ->  B to A
+ *   lg_collide_capsule_capsule(sim.h:306)  delta = c1_on_a - c2_on_b       ->  B to A
+ *   lg_collide_sphere_cylinder(sim.h:379)  delta = sphere - edge           ->  B to A
+ *   lg_collide_sphere_plane   (sim.h:76)   the plane's outward normal      ->  B to A
+ *   lg_collide_box_plane      (sim.h:113)  the plane's outward normal      ->  B to A
+ *
+ * So lg_contact_t's "Normal pointing from A to B" (sim.h:25) describes exactly one of the
+ * eight, and lg_resolve_contact — which assumes B to A (sim.h:515, 544) — is right about
+ * the other seven. Sphere-sphere is the lone exception, and sphere-sphere was every body
+ * in this game, which is why a ship flew through the middle of the mothership while
+ * exchanging just enough momentum to look like collisions worked.
+ *
+ * This wrapper calls lagrange's geometry and flips the odd ones out, so everything below
+ * it can rely on one rule: **the normal points from i toward j.**
+ *
+ * ROTATION. lagrange's box routines are AABB-only — they clamp against position ±
+ * half_extents in world axes and never read the rotation. Rather than reimplement the
+ * clamp, ag_sphere_vs_box rotates the sphere into the box's own frame, where the box *is*
+ * axis-aligned, and rotates the resulting normal back out. Capsule and cylinder need no
+ * such help: lagrange already takes their axis as a rotated vector.
+ *===========================================================================*/
+
+typedef struct {
+    lg_vec3_t normal;       /* unit, points from i toward j */
+    float penetration;      /* > 0 where they overlap */
+} ag_contact;
+
+/* The long axis of a capsule or cylinder, in world space.
+ *
+ * Defaults to the body's local +Y, which is lagrange's convention — lg_collider_inertia
+ * builds its tensor around Y as well (collider.h:159, 167), so shape and inertia agree for
+ * free. AG_AXIS_Z bodies use local +Z instead and have their inertia swizzled at spawn to
+ * match; see ag_finish_spawn and the note on ag_axis in bridge.h. */
+static lg_vec3_t ag_shape_axis(const ag_world* self, lg_entity_t e,
+                               const lg_transform_t* t) {
+    lg_vec3_t local = lg_vec3(0.0f, 1.0f, 0.0f);
+    if (self->shape_axis && (size_t)e < self->shape_axis_cap &&
+        self->shape_axis[e] == AG_AXIS_Z) {
+        local = lg_vec3(0.0f, 0.0f, 1.0f);
+    }
+    return lg_quat_rotate(t->rotation, local);
+}
+
+/* Sphere vs box, honouring the box's rotation. Normal points sphere -> box. */
+static bool ag_sphere_vs_box(lg_vec3_t sp, float sr,
+                             const lg_transform_t* bt, lg_vec3_t bhalf,
+                             ag_contact* out) {
+    lg_vec3_t local = lg_quat_rotate(lg_quat_conj(bt->rotation),
+                                     lg_vec3_sub(sp, bt->position));
+
+    lg_contact_t c;
+    if (!lg_collide_sphere_box(local, sr, lg_vec3_zero(), bhalf, &c)) return false;
+
+    /* lagrange gives box -> sphere in box space; negate for sphere -> box, then back to
+     * world. */
+    out->normal = lg_quat_rotate(bt->rotation, lg_vec3_neg(c.normal));
+    out->penetration = c.penetration;
+    return true;
+}
+
+/* The plane's outward normal in world space. lg_narrow_phase is inconsistent here too —
+ * it rotates for sphere-plane (sim.h:592) but uses the unrotated field for box-plane
+ * (sim.h:613). Rotating always is the defensible one. */
+static lg_vec3_t ag_plane_normal(const lg_transform_t* t, const lg_collider_t* c) {
+    lg_vec3_t n = lg_quat_rotate(t->rotation, c->plane.normal);
+    return (lg_vec3_len_sq(n) > 1e-12f) ? lg_vec3_norm(n) : lg_vec3_up();
+}
+
+/* Contact between storage slots i and j with the normal pointing i -> j.
+ *
+ * Ordered pairs are written once and the reversed order reuses them with the normal
+ * negated, so there is one implementation per shape pair rather than two. */
+static bool ag_narrow_phase(ag_world* self, size_t i, size_t j, ag_contact* out) {
+    lg_storage_t* s = &self->w->storage;
+    const lg_collider_t* ci = &s->colliders[i];
+    const lg_collider_t* cj = &s->colliders[j];
+    const lg_transform_t* ti = &s->transforms[i];
+    const lg_transform_t* tj = &s->transforms[j];
+
+    const int a = (int)ci->type, b = (int)cj->type;
+    lg_contact_t c;
+
+    /* --- sphere vs sphere: the one pair lagrange already points i -> j --- */
+    if (a == LG_SHAPE_SPHERE && b == LG_SHAPE_SPHERE) {
+        if (!lg_collide_spheres(ti->position, ci->sphere.radius,
+                                tj->position, cj->sphere.radius, &c)) return false;
+        out->normal = c.normal;
+        out->penetration = c.penetration;
+        return true;
+    }
+
+    /* --- sphere vs box --- */
+    if (a == LG_SHAPE_SPHERE && b == LG_SHAPE_BOX)
+        return ag_sphere_vs_box(ti->position, ci->sphere.radius, tj, cj->box.half_extents, out);
+    if (a == LG_SHAPE_BOX && b == LG_SHAPE_SPHERE) {
+        if (!ag_sphere_vs_box(tj->position, cj->sphere.radius, ti, ci->box.half_extents, out))
+            return false;
+        out->normal = lg_vec3_neg(out->normal);   /* was j -> i */
+        return true;
+    }
+
+    /* --- sphere vs capsule --- */
+    if (a == LG_SHAPE_SPHERE && b == LG_SHAPE_CAPSULE) {
+        if (!lg_collide_sphere_capsule(ti->position, ci->sphere.radius,
+                                       tj->position, ag_shape_axis(self, s->entities[j], tj),
+                                       cj->capsule.half_height, cj->capsule.radius, &c))
+            return false;
+        out->normal = lg_vec3_neg(c.normal);
+        out->penetration = c.penetration;
+        return true;
+    }
+    if (a == LG_SHAPE_CAPSULE && b == LG_SHAPE_SPHERE) {
+        if (!lg_collide_sphere_capsule(tj->position, cj->sphere.radius,
+                                       ti->position, ag_shape_axis(self, s->entities[i], ti),
+                                       ci->capsule.half_height, ci->capsule.radius, &c))
+            return false;
+        out->normal = c.normal;   /* capsule -> sphere is already i -> j */
+        out->penetration = c.penetration;
+        return true;
+    }
+
+    /* --- sphere vs cylinder --- */
+    if (a == LG_SHAPE_SPHERE && b == LG_SHAPE_CYLINDER) {
+        if (!lg_collide_sphere_cylinder(ti->position, ci->sphere.radius,
+                                        tj->position, ag_shape_axis(self, s->entities[j], tj),
+                                        cj->cylinder.half_height, cj->cylinder.radius, &c))
+            return false;
+        out->normal = lg_vec3_neg(c.normal);
+        out->penetration = c.penetration;
+        return true;
+    }
+    if (a == LG_SHAPE_CYLINDER && b == LG_SHAPE_SPHERE) {
+        if (!lg_collide_sphere_cylinder(tj->position, cj->sphere.radius,
+                                        ti->position, ag_shape_axis(self, s->entities[i], ti),
+                                        ci->cylinder.half_height, ci->cylinder.radius, &c))
+            return false;
+        out->normal = c.normal;
+        out->penetration = c.penetration;
+        return true;
+    }
+
+    /* --- sphere/box vs plane --- */
+    if (a == LG_SHAPE_SPHERE && b == LG_SHAPE_PLANE) {
+        if (!lg_collide_sphere_plane(ti->position, ci->sphere.radius,
+                                     ag_plane_normal(tj, cj), cj->plane.distance, &c))
+            return false;
+        out->normal = lg_vec3_neg(c.normal);
+        out->penetration = c.penetration;
+        return true;
+    }
+    if (a == LG_SHAPE_PLANE && b == LG_SHAPE_SPHERE) {
+        if (!lg_collide_sphere_plane(tj->position, cj->sphere.radius,
+                                     ag_plane_normal(ti, ci), ci->plane.distance, &c))
+            return false;
+        out->normal = c.normal;
+        out->penetration = c.penetration;
+        return true;
+    }
+    if (a == LG_SHAPE_BOX && b == LG_SHAPE_PLANE) {
+        if (!lg_collide_box_plane(ti->position, ci->box.half_extents,
+                                  ag_plane_normal(tj, cj), cj->plane.distance, &c))
+            return false;
+        out->normal = lg_vec3_neg(c.normal);
+        out->penetration = c.penetration;
+        return true;
+    }
+    if (a == LG_SHAPE_PLANE && b == LG_SHAPE_BOX) {
+        if (!lg_collide_box_plane(tj->position, cj->box.half_extents,
+                                  ag_plane_normal(ti, ci), ci->plane.distance, &c))
+            return false;
+        out->normal = c.normal;
+        out->penetration = c.penetration;
+        return true;
+    }
+
+    /* --- capsule vs capsule --- */
+    if (a == LG_SHAPE_CAPSULE && b == LG_SHAPE_CAPSULE) {
+        if (!lg_collide_capsule_capsule(ti->position, ag_shape_axis(self, s->entities[i], ti),
+                                        ci->capsule.half_height, ci->capsule.radius,
+                                        tj->position, ag_shape_axis(self, s->entities[j], tj),
+                                        cj->capsule.half_height, cj->capsule.radius, &c))
+            return false;
+        out->normal = lg_vec3_neg(c.normal);
+        out->penetration = c.penetration;
+        return true;
+    }
+
+    /* --- box vs box ---
+     *
+     * lagrange's is an AABB overlap test: it ignores both rotations. That is a real
+     * limitation and it is left in place rather than papered over, because in this game
+     * the pair cannot arise — every dynamic body is a sphere, so two boxes are always two
+     * pieces of static scenery, and the resolver skips static/static before it ever gets
+     * here. If a dynamic box is ever added, this needs SAT over the 15 separating axes and
+     * the note on ag_spawn_box has to change with it. */
+    if (a == LG_SHAPE_BOX && b == LG_SHAPE_BOX) {
+        if (!lg_collide_box_box(ti->position, ci->box.half_extents,
+                                tj->position, cj->box.half_extents, &c)) return false;
+        out->normal = lg_vec3_neg(c.normal);
+        out->penetration = c.penetration;
+        return true;
+    }
+
+    /* capsule/box, capsule/cylinder, cylinder/cylinder, cylinder/box, plane/plane and
+     * plane/capsule: lagrange has no routine for these either. Reporting no contact is the
+     * honest answer, and ag_collider_pair_supported lets Go refuse the spawn instead of
+     * letting a body silently fall through the world. */
+    return false;
+}
+
+/*============================================================================
  * Collision resolution
  *
- * WHY THIS IS HERE INSTEAD OF lagrange's
- * --------------------------------------
- * lagrange's narrow phase builds the contact normal pointing from A to B
- * (lg_collide_spheres: delta = pos_b - pos_a, sim.h:37), but lg_resolve_contact assumes
- * it points from B to A -- its own comments say "Correction is along normal (from B
- * toward A)" (sim.h:544) and "Body A gets pushed along normal" (sim.h:515).
- *
- * With the normal actually pointing A->B, an approaching pair computes
- * vel_along_normal > 0, which the resolver reads as "separating" and returns early
- * without resolving anything. Once the bodies have passed through each other and are
- * genuinely separating, the sign flips and the impulse pulls them back together.
- *
- * The visible result is that nothing bounces properly and a ship flies straight through
- * the middle of the mothership -- while still exchanging some momentum, which makes it
- * look superficially like collisions work.
- *
- * So: every collider is marked as a trigger, which makes lagrange's own narrow phase
- * skip it entirely (sim.h:566), and the sphere-sphere case is resolved here with a
- * consistent convention. Every body in this game is a sphere.
+ * Runs on the contacts above rather than lagrange's lg_resolve_contact, which reads the
+ * normal in the opposite direction to the one sphere-sphere produces (see the table).
+ * Every collider is still flagged as a trigger so lagrange's own pass finds nothing
+ * (sim.h:566) and cannot resolve the same contact twice with the other sign.
  *
  * Not carried over: angular impulse from contacts (rocks do not gain spin from being
  * hit) and Coulomb friction. Both are fidelity, not correctness, and neither is missed
- * in a frictionless vacuum.
+ * in a frictionless vacuum. Note that angular impulse matters more for the non-sphere
+ * shapes, whose contact points are genuinely off-centre — a box clipped on one corner
+ * ought to tumble and will not.
  *===========================================================================*/
 
 #define AG_SOLVER_ITERATIONS 4
@@ -109,13 +332,7 @@ static void ag_resolve_collisions(ag_world* self, bool record) {
     lg_storage_t* s = &self->w->storage;
 
     for (size_t i = 0; i < s->count; i++) {
-        const lg_collider_t* ca = &s->colliders[i];
-        if (ca->type != LG_SHAPE_SPHERE) continue;
-
         for (size_t j = i + 1; j < s->count; j++) {
-            const lg_collider_t* cb = &s->colliders[j];
-            if (cb->type != LG_SHAPE_SPHERE) continue;
-
             lg_body_t* ba = &s->bodies[i];
             lg_body_t* bb = &s->bodies[j];
 
@@ -124,19 +341,12 @@ static void ag_resolve_collisions(ag_world* self, bool record) {
             float inv_sum = inv_a + inv_b;
             if (inv_sum <= 0.0f) continue; /* two static bodies */
 
-            lg_vec3_t pa = s->transforms[i].position;
-            lg_vec3_t pb = s->transforms[j].position;
+            ag_contact contact;
+            if (!ag_narrow_phase(self, i, j, &contact)) continue;
 
             /* n points from A toward B, and everything below is consistent with that. */
-            lg_vec3_t delta = lg_vec3_sub(pb, pa);
-            float dist_sq = lg_vec3_len_sq(delta);
-            float radius_sum = ca->sphere.radius + cb->sphere.radius;
-            if (dist_sq > radius_sum * radius_sum) continue;
-
-            float dist = sqrtf(dist_sq);
-            lg_vec3_t n = (dist > 1e-6f) ? lg_vec3_scale(delta, 1.0f / dist)
-                                         : lg_vec3(0.0f, 1.0f, 0.0f);
-            float penetration = radius_sum - dist;
+            lg_vec3_t n = contact.normal;
+            float penetration = contact.penetration;
 
             /* Relative velocity of B with respect to A, along n.
              * Negative means closing. */
@@ -207,6 +417,16 @@ ag_world* ag_world_create(float time_step, size_t max_entities) {
         return NULL;
     }
 
+    /* +1 because ids are 1-based and bounded by max_entities, so max_entities itself is a
+     * valid index. calloc leaves every entry AG_AXIS_Y, which is the right default. */
+    self->shape_axis_cap = max_entities + 1;
+    self->shape_axis = (uint8_t*)calloc(self->shape_axis_cap, sizeof(uint8_t));
+    if (!self->shape_axis) {
+        lg_world_destroy(self->w);
+        free(self);
+        return NULL;
+    }
+
     /* lg_world_create seeds world->gravity from config, but be explicit: drifting is
      * the whole feel of the game and a stray -9.81 would be very confusing. */
     lg_world_set_gravity_v(self->w, lg_vec3_zero());
@@ -221,6 +441,7 @@ ag_world* ag_world_create(float time_step, size_t max_entities) {
 void ag_world_free(ag_world* self) {
     if (!self) return;
     lg_world_destroy(self->w);
+    free(self->shape_axis);
     free(self);
 }
 
@@ -229,16 +450,36 @@ void ag_world_free(ag_world* self) {
  *===========================================================================*/
 
 static uint64_t ag_finish_spawn(ag_world* self, lg_entity_t e, float mass,
-                                const lg_collider_t* col,
+                                const lg_collider_t* col, int axis,
                                 float px, float py, float pz) {
     if (e == LG_ENTITY_INVALID) return 0;
+
+    /* Record the axis before anything can early-return, so a recycled id never inherits the
+     * previous occupant's choice. */
+    if (self->shape_axis && (size_t)e < self->shape_axis_cap) {
+        self->shape_axis[e] = (axis == AG_AXIS_Z) ? AG_AXIS_Z : AG_AXIS_Y;
+    }
 
     lg_body_t body = lg_body(mass);
 
     /* Derive the inertia tensor from the actual shape. lg_body() leaves it as the unit
      * vector, which would make a 5-tonne asteroid spin like a pebble. */
     if (mass > 0.0f) {
-        lg_body_set_inertia(&body, lg_collider_inertia(col, mass));
+        lg_vec3_t inertia = lg_collider_inertia(col, mass);
+
+        /* lg_collider_inertia assumes the long axis is Y, returning (ixz, iy, ixz) for
+         * capsules and cylinders (collider.h:159, 167). A Z-axis body is long along Z
+         * instead, so the cheap term belongs on Z: swap Y and Z. Without this a Z-axis
+         * capsule would collide along one axis and resist spin about another — the exact
+         * inconsistency the normal table above documents. */
+        if (axis == AG_AXIS_Z &&
+            (col->type == LG_SHAPE_CAPSULE || col->type == LG_SHAPE_CYLINDER)) {
+            float tmp = inertia.y;
+            inertia.y = inertia.z;
+            inertia.z = tmp;
+        }
+
+        lg_body_set_inertia(&body, inertia);
     }
 
     /* Mild damping so nothing drifts forever after a nudge. Space has none, but a game
@@ -264,18 +505,78 @@ uint64_t ag_spawn_sphere(ag_world* self, float mass, float radius,
                          float px, float py, float pz) {
     if (!self) return 0;
     lg_collider_t col = lg_collider_sphere(radius);
-    return ag_finish_spawn(self, lg_entity_create(self->w), mass, &col, px, py, pz);
+    return ag_finish_spawn(self, lg_entity_create(self->w), mass, &col, AG_AXIS_Y,
+                           px, py, pz);
 }
 
 uint64_t ag_spawn_box(ag_world* self, float mass, float hx, float hy, float hz,
                       float px, float py, float pz) {
     if (!self) return 0;
     lg_collider_t col = lg_collider_box(hx, hy, hz);
-    return ag_finish_spawn(self, lg_entity_create(self->w), mass, &col, px, py, pz);
+    return ag_finish_spawn(self, lg_entity_create(self->w), mass, &col, AG_AXIS_Y,
+                           px, py, pz);
+}
+
+uint64_t ag_spawn_capsule(ag_world* self, float mass, float radius, float half_height,
+                          int axis, float px, float py, float pz) {
+    if (!self) return 0;
+    /* lg_collider_capsule takes the *full* height and halves it internally
+     * (collider.h:83), so undo that here — every other shape in this API is expressed in
+     * half-extents and a capsule that came out twice as long as asked for would be a
+     * miserable thing to debug. */
+    lg_collider_t col = lg_collider_capsule(radius, half_height * 2.0f);
+    return ag_finish_spawn(self, lg_entity_create(self->w), mass, &col, axis,
+                           px, py, pz);
+}
+
+uint64_t ag_spawn_cylinder(ag_world* self, float mass, float radius, float half_height,
+                           int axis, float px, float py, float pz) {
+    if (!self) return 0;
+    lg_collider_t col = lg_collider_cylinder(radius, half_height * 2.0f);
+    return ag_finish_spawn(self, lg_entity_create(self->w), mass, &col, axis,
+                           px, py, pz);
+}
+
+uint64_t ag_spawn_plane(ag_world* self, float nx, float ny, float nz, float distance) {
+    if (!self) return 0;
+    /* Always static: an infinite half-space with a mass is not a thing. */
+    lg_collider_t col = lg_collider_plane(lg_vec3(nx, ny, nz), distance);
+    return ag_finish_spawn(self, lg_entity_create(self->w), 0.0f, &col, AG_AXIS_Y,
+                           0.0f, 0.0f, 0.0f);
+}
+
+void ag_set_rotation(ag_world* self, uint64_t entity, float x, float y, float z, float w) {
+    if (!self) return;
+    lg_quat_t q = {x, y, z, w};
+    lg_set_rotation(self->w, (lg_entity_t)entity, lg_quat_norm(q));
+}
+
+bool ag_collider_pair_supported(int shape_a, int shape_b) {
+    /* Mirrors the dispatch in ag_narrow_phase. Kept as a query so Go can reject a spawn
+     * whose shape cannot collide with anything it will meet, rather than letting the body
+     * fall through the world silently — which is how the old box collider behaved and is a
+     * far worse failure than an error at spawn time. */
+    const int SP = LG_SHAPE_SPHERE, BX = LG_SHAPE_BOX, CA = LG_SHAPE_CAPSULE,
+              CY = LG_SHAPE_CYLINDER, PL = LG_SHAPE_PLANE;
+
+    int lo = shape_a < shape_b ? shape_a : shape_b;
+    int hi = shape_a < shape_b ? shape_b : shape_a;
+
+    if (lo == SP && (hi == SP || hi == BX || hi == CA || hi == CY || hi == PL)) return true;
+    if (lo == BX && (hi == BX || hi == PL)) return true;
+    if (lo == CA && hi == CA) return true;
+    return false;
 }
 
 void ag_despawn(ag_world* self, uint64_t entity) {
     if (!self) return;
+    /* Reset the axis so a recycled id starts from the default rather than inheriting it.
+     * ag_finish_spawn also writes it unconditionally, so this is belt and braces — but the
+     * failure it guards against is a capsule that silently collides about the wrong axis,
+     * which is not the sort of thing that announces itself. */
+    if (self->shape_axis && entity < self->shape_axis_cap) {
+        self->shape_axis[entity] = AG_AXIS_Y;
+    }
     lg_entity_destroy(self->w, (lg_entity_t)entity);
 }
 
